@@ -4,6 +4,7 @@ const app = express();
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const cors = require('cors');
 const db = require('./config/db');
+const { ensureSchema } = require('./models/init_schema');
 const venueRoutes = require('./routes/venue_routes');
 const adminRoutes = require('./routes/admin_routes');
 
@@ -21,6 +22,7 @@ app.use('/api/admin', adminRoutes);
 
 async function start() {
   await db.init();
+  await ensureSchema(db.pool);
 
   app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
