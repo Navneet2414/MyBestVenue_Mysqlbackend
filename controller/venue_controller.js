@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query, getConnection } = require('../config/db');
 // const { ensureVenuesTable } = require('../models/table_venues');
+const { ensureSpacetypeTable } = require('../models/table_spacetype');
 
 const EMAIL_REGEX = /^[a-zA-Z0-9](\.?[a-zA-Z0-9_-])*@[a-zA-Z0-9-]+(\.[a-zA-Z]{2,})+$/;
 
@@ -84,9 +85,9 @@ const registerVenue = async (req, res) => {
       return res.status(400).json({ message: 'All required fields must be provided' });
     }
 
-    if (normalizedBusinessType !== 'venue') {
-      return res.status(400).json({ message: 'businessType must be venue' });
-    }
+    // if (normalizedBusinessType !== 'venue') {
+    //   return res.status(400).json({ message: 'businessType must be venue' });
+    // }
 
     // if (!venueType) {
     //   return res.status(400).json({ message: 'venueType is required' });
@@ -509,7 +510,7 @@ const updateVenueProfile = async (req, res) => {
     }
 
     const [updatedRows] = await conn.query(
-      'SELECT venue_id AS id, businessName, businessType, contactName, email, phone, isPremium, profilePicture, address, city_id AS city, state_id AS state, country_id AS country, pinCode, nearLocation, status, updatedAt FROM tbl_venue WHERE venue_id = ? LIMIT 1',
+      'SELECT venue_id AS id, businessName, businessType, contactName, email, phone, businessExperience, isPremium, profilePicture, address, city_id AS city, state_id AS state, country_id AS country, pinCode, nearLocation, status, updatedAt FROM tbl_venue WHERE venue_id = ? LIMIT 1',
       [vendorId]
     );
 
@@ -591,6 +592,7 @@ const getVenueById = async (req, res) => {
     const [rows] = await query(
       `SELECT
         v.venue_id AS id, v.businessName, v.businessType, v.contactName, v.email, v.phone,
+        v.businessExperience,
         v.profilePicture, v.address,
         v.city_id AS city_id, c.city_name AS city,
         v.state_id AS state_id, s.state_name AS state,
@@ -934,8 +936,565 @@ const deleteAmenities = async (req, res) => {
   }
 };
 
+// get All Venue List Api 
+
+const escapeLike = (value) => String(value).replace(/[\\%_]/g, '\\$&');
+
+const getAllVenues = async (req, res) => {
+  const pageRaw = Number(req.query?.page ?? 1);
+  const limitRaw = Number(req.query?.limit ?? 10);
+  const searchRaw = req.query?.search ?? req.query?.businessName ?? '';
+
+  const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 10;
+  const offset = (page - 1) * limit;
+
+  const search = String(searchRaw || '').trim();
+  const where = [];
+  const params = [];
+
+  if (search) {
+    where.push('v.businessName LIKE ? ESCAPE \'\\\\\'');
+    params.push(`%${escapeLike(search)}%`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  try {
+    const [countRows] = await query(
+      `SELECT COUNT(*) AS total
+       FROM tbl_venue v
+       ${whereSql}`,
+      params
+    );
+
+    const total = Number(countRows?.[0]?.total || 0);
+    const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+
+    const [rows] = await query(
+      `SELECT
+         v.venue_id AS id,
+         v.businessName,
+         v.businessType,
+         v.contactName,
+         v.email,
+         v.phone,
+         v.profilePicture,
+         v.status,
+         v.address,
+         v.city_id,
+         v.state_id,
+         v.country_id,
+         v.pinCode,
+         v.nearLocation,
+         v.isApproved,
+         v.isVerified,
+         v.isPremium,
+         v.isTrusted,
+         v.venueCapacity,
+         v.createdAt,
+         v.updatedAt
+       FROM tbl_venue v
+       ${whereSql}
+       ORDER BY v.venue_id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    return res.status(200).json({
+      message: 'Venue list fetched successfully',
+      pagination: { page, limit, total, totalPages },
+      venues: rows,
+    });
+  } catch (error) {
+    console.error('getAllVenues error:', error);
+    return res.status(500).json({ message: 'Error getting venue list', error: error.message || String(error) });
+  }
+};
 
 
+// get Similar venue List Api 
+const getSimilarVenues = async (req, res) => {
+  const venueIdRaw = req.params.id;
+  const limitRaw = Number(req.query?.limit ?? 10);
+
+  const venueId = Number(venueIdRaw);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 50) : 10;
+  const includeAll = String(req.query?.includeAll ?? '0') === '1';
+
+  const visibilityWhere = includeAll ? '' : ' AND v.status = 1 AND v.isApproved = 1';
+
+  try {
+    if (!Number.isInteger(venueId) || venueId <= 0) {
+      return res.status(400).json({ message: 'Valid venue id is required' });
+    }
+
+    const [baseRows] = await query(
+      `SELECT venue_id AS id, city_id, businessType, nearLocation
+       FROM tbl_venue
+       WHERE venue_id = ?
+       LIMIT 1`,
+      [venueId]
+    );
+
+    if (baseRows.length === 0) {
+      return res.status(404).json({ message: 'Venue not found' });
+    }
+
+    const base = baseRows[0];
+    const cityId = base.city_id;
+    const businessType = base.businessType ? String(base.businessType).trim() : '';
+    const nearLocation = base.nearLocation ? String(base.nearLocation).trim() : '';
+
+    if (!cityId || !businessType) {
+      return res.status(200).json({
+        message: 'Similar venues fetched successfully',
+        baseVenue: { id: venueId, city_id: cityId, businessType, nearLocation },
+        venues: [],
+      });
+    }
+
+    const [venues] = await query(
+      `SELECT
+         v.venue_id AS id,
+         v.businessName,
+         v.businessType,
+         v.profilePicture,
+         v.city_id,
+         c.city_name AS city,
+         v.nearLocation,
+         v.venueCapacity,
+         v.veg_price,
+         v.non_veg_price,
+         v.halfday_rental_price,
+         v.fullday_rental_price,
+         v.isPremium,
+         v.isTrusted,
+         v.views,
+         v.updatedAt
+       FROM tbl_venue v
+       LEFT JOIN tbl_city c ON c.city_id = v.city_id
+       WHERE v.venue_id <> ?
+         AND v.city_id = ?
+         AND LOWER(TRIM(v.businessType)) = ?
+         ${visibilityWhere}
+       ORDER BY
+         (CASE WHEN v.nearLocation = ? THEN 1 ELSE 0 END) DESC,
+         v.isPremium DESC,
+         v.isTrusted DESC,
+         v.views DESC,
+         v.updatedAt DESC
+       LIMIT ?`,
+      [venueId, cityId, businessType.toLowerCase(), nearLocation, limit]
+    );
+
+    return res.status(200).json({
+      message: 'Similar venues fetched successfully',
+      baseVenue: { id: venueId, city_id: cityId, businessType, nearLocation },
+      venues,
+    });
+  } catch (error) {
+    console.error('getSimilarVenues error:', error);
+    return res.status(500).json({ message: 'Error getting similar venues', error: error.message || String(error) });
+  }
+};
+
+// Get Latest venue by cityId and businessType Api
+const getlatestVenueTypeData = async (req, res) => {
+  const cityIdRaw =  req.query?.cityId;
+  const businessTypeRaw = req.query?.businessType ;
+  const limitRaw = Number(req.query?.limit ?? 20);
+  const pageRaw = Number(req.query?.page ?? 1);
+  const includeAll = String(req.query?.includeAll ?? '0') === '1';
+
+  const cityId = cityIdRaw === undefined ? null : Number(cityIdRaw);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 20;
+  const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+  const offset = (page - 1) * limit;
+
+  try {
+    const where = ["businessType IS NOT NULL", "TRIM(businessType) <> ''"];
+    const params = [];
+
+    if (cityIdRaw !== undefined) {
+      if (!Number.isInteger(cityId) || cityId <= 0) {
+        return res.status(400).json({ message: 'Valid city_id is required' });
+      }
+      where.push('city_id = ?');
+      params.push(cityId);
+    }
+
+    const businessTypeInput = businessTypeRaw === undefined ? '' : String(businessTypeRaw || '').trim();
+    if (businessTypeInput) {
+      const normalized = businessTypeInput.toLowerCase();
+      where.push('(businessType = ? OR LOWER(TRIM(businessType)) = ?)');
+      params.push(normalized, normalized);
+    }
+
+    const [rows] = await query(
+      `SELECT
+         LOWER(TRIM(businessType)) AS businessType,
+         COUNT(*) AS total,
+         MAX(updatedAt) AS latestUpdatedAt
+       FROM tbl_venue
+       WHERE ${where.join(' AND ')}
+       GROUP BY LOWER(TRIM(businessType))
+       ORDER BY latestUpdatedAt DESC, total DESC
+       LIMIT ?`,
+      [...params, limit]
+    );
+
+    if (businessTypeInput) {
+      const total = Number(rows?.[0]?.total || 0);
+      const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+
+      const venueWhere = [];
+      const venueParams = [];
+
+      venueWhere.push("v.businessType IS NOT NULL");
+      venueWhere.push("TRIM(v.businessType) <> ''");
+
+      if (cityIdRaw !== undefined) {
+        venueWhere.push('v.city_id = ?');
+        venueParams.push(cityId);
+      }
+
+      const normalized = businessTypeInput.toLowerCase();
+      venueWhere.push('(v.businessType = ? OR LOWER(TRIM(v.businessType)) = ?)');
+      venueParams.push(normalized, normalized);
+
+      if (!includeAll) {
+        venueWhere.push('v.status = 1');
+        venueWhere.push('v.isApproved = 1');
+      }
+
+      const [venueRows] = await query(
+        `SELECT
+           v.venue_id AS id,
+           v.businessName,
+           v.businessType,
+           v.profilePicture,
+           v.city_id,
+           c.city_name AS city,
+           v.nearLocation,
+           v.venueCapacity,
+           v.veg_price,
+           v.non_veg_price,
+           v.halfday_rental_price,
+           v.fullday_rental_price,
+           v.isPremium,
+           v.isTrusted,
+           v.views,
+           v.updatedAt
+         FROM tbl_venue v
+         LEFT JOIN tbl_city c ON c.city_id = v.city_id
+         WHERE ${venueWhere.join(' AND ')}
+         ORDER BY v.updatedAt DESC, v.venue_id DESC
+         LIMIT ? OFFSET ?`,
+        [...venueParams, limit, offset]
+      );
+
+      return res.status(200).json({
+        message: 'Venue type latest data fetched successfully',
+        city_id: cityIdRaw !== undefined ? cityId : null,
+        businessType: businessTypeInput,
+        summary: rows[0] || { businessType: normalized, total: 0, },
+        pagination: { page, limit, total, totalPages },
+        venues: venueRows,
+      });
+    }
+
+    return res.status(200).json({
+      message: 'Venue types fetched successfully',
+      city_id: cityIdRaw !== undefined ? cityId : null,
+      businessType: null,
+      vendorTypes: rows,
+    });
+  } catch (error) {
+    console.error('getlatestVendorTypeData error:', error);
+    return res.status(500).json({ message: 'Error getting vendor types', error: error.message || String(error) });
+  }
+};
+
+const getVenueByCity = async (req, res) => {
+
+  const cityIdRaw = req.params.cityId;
+  const businessTypeRaw = req.query?.businessType ?? '';
+  const searchRaw = req.query?.search ?? '';
+
+  const pageRaw = Number(req.query?.page ?? 1);
+  const limitRaw = Number(req.query?.limit ?? 10);
+
+  const cityId = Number(cityIdRaw);
+  const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 10;
+  const offset = (page - 1) * limit;
+
+  const includeAll = String(req.query?.includeAll ?? '0') === '1';
+
+  const businessType = String(businessTypeRaw || '').trim().toLowerCase();
+  const search = String(searchRaw || '').trim();
+
+  try {
+    if (!Number.isInteger(cityId) || cityId <= 0) {
+      return res.status(400).json({ message: 'Valid city id is required' });
+    }
+
+    const where = ['v.city_id = ?'];
+    const params = [cityId];
+
+    if (!includeAll) {
+      where.push('v.status = 1');
+      where.push('v.isApproved = 1');
+    }
+
+    if (businessType) {
+      where.push('LOWER(v.businessType) = ?');
+      params.push(businessType);
+    }
+
+    if (search) {
+      where.push('v.businessName LIKE ? ESCAPE \'\\\\\'');
+      params.push(`%${escapeLike(search)}%`);
+    }
+
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+
+    const [countRows] = await query(
+      `SELECT COUNT(*) AS total
+       FROM tbl_venue v
+       ${whereSql}`,
+      params
+    );
+
+    const total = Number(countRows?.[0]?.total || 0);
+    const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+
+    const [rows] = await query(
+      `SELECT
+         v.venue_id AS id,
+         v.businessName,
+         v.businessType,
+         v.profilePicture,
+         v.city_id,
+         c.city_name AS city,
+         v.nearLocation,
+         v.venueCapacity,
+         v.veg_price,
+         v.non_veg_price,
+         v.halfday_rental_price,
+         v.fullday_rental_price,
+         v.isPremium,
+         v.isTrusted,
+         v.views,
+         v.updatedAt
+       FROM tbl_venue v
+       LEFT JOIN tbl_city c ON c.city_id = v.city_id
+       ${whereSql}
+       ORDER BY v.isPremium DESC, v.isTrusted DESC, v.views DESC, v.updatedAt DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    return res.status(200).json({
+      message: 'Venue list fetched successfully',
+      city_id: cityId,
+      pagination: { page, limit, total, totalPages },
+      venues: rows,
+    });
+  } catch (error) {
+    console.error('getVenueByCity error:', error);
+    return res.status(500).json({ message: 'Error getting venues by city', error: error.message || String(error) });
+  }
+};
+
+// get venues by Occasion
+// cityId is optional: if provided, filter by city; otherwise return all venues for the occasion.
+const getVenuesByOccasion = async (req, res) => {
+  const occasionIdRaw = req.params.occasionId;
+  const cityIdRaw = req.query?.cityId;
+  const includeAll = String(req.query?.includeAll ?? '0') === '1';
+
+  const pageRaw = Number(req.query?.page ?? 1);
+  const limitRaw = Number(req.query?.limit ?? 10);
+
+  const occasionId = Number(occasionIdRaw);
+  const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 10;
+  const offset = (page - 1) * limit;
+
+  const cityId = cityIdRaw === undefined ? null : Number(cityIdRaw);
+
+  try {
+    if (!Number.isInteger(occasionId) || occasionId <= 0) {
+      return res.status(400).json({ message: 'Valid occasion id is required' });
+    }
+
+    if (cityIdRaw !== undefined && (!Number.isInteger(cityId) || cityId <= 0)) {
+      return res.status(400).json({ message: 'Valid cityId is required' });
+    }
+
+    const where = ['vo.occasion_id = ?'];
+    const params = [occasionId];
+
+    if (cityIdRaw !== undefined) {
+      where.push('v.city_id = ?');
+      params.push(cityId);
+    }
+
+    if (!includeAll) {
+      where.push('v.status = 1');
+      where.push('v.isApproved = 1');
+    }
+
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+
+    const [countRows] = await query(
+      `SELECT COUNT(*) AS total
+       FROM tbl_venue_occasion vo
+       INNER JOIN tbl_venue v ON v.venue_id = vo.venue_id
+       ${whereSql}`,
+      params
+    );
+
+    const total = Number(countRows?.[0]?.total || 0);
+    const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+
+    const [rows] = await query(
+      `SELECT
+         v.venue_id AS id,
+         v.businessName,
+         v.businessType,
+         v.profilePicture,
+         v.city_id,
+         c.city_name AS city,
+         v.nearLocation,
+         v.venueCapacity,
+         v.veg_price,
+         v.non_veg_price,
+         v.halfday_rental_price,
+         v.fullday_rental_price,
+         v.isPremium,
+         v.isTrusted,
+         v.views,
+         v.updatedAt,
+         o.occasion_id AS occasion_id,
+         o.occasion_name AS occasion_name
+       FROM tbl_venue_occasion vo
+       INNER JOIN tbl_venue v ON v.venue_id = vo.venue_id
+       LEFT JOIN tbl_city c ON c.city_id = v.city_id
+       LEFT JOIN tbl_occasion o ON o.occasion_id = vo.occasion_id
+       ${whereSql}
+       ORDER BY v.isPremium DESC, v.isTrusted DESC, v.views DESC, v.updatedAt DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    return res.status(200).json({
+      message: 'Venue list fetched successfully',
+      occasion_id: occasionId,
+      city_id: cityIdRaw !== undefined ? cityId : null,
+      pagination: { page, limit, total, totalPages },
+      venues: rows,
+    });
+  } catch (error) {
+    console.error('getVenuesByOccasion error:', error);
+    return res.status(500).json({ message: 'Error getting venues by occasion', error: error.message || String(error) });
+  }
+};
+// search occasion by name  and show id of occasion Api 
+const searchOccasion = async (req, res) => {
+  const nameRaw = req.query?.q ?? req.query?.occasionName;
+  const name = String(nameRaw || '').trim();
+  const limitRaw = Number(req.query?.limit ?? 50);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
+
+  try {
+    if (!name) {
+      return res.status(400).json({ message: "Occasion name is required" });
+    }
+
+    const normalized = name.toLowerCase();
+
+    // If an exact occasion exists (case-insensitive), return only that (e.g. searching "Wedding" returns only "Wedding").
+    const [exactRows] = await query(
+      `SELECT occasion_id, occasion_name
+       FROM tbl_occasion
+       WHERE active = 1
+         AND LOWER(TRIM(occasion_name)) = ?
+       LIMIT 1`,
+      [normalized]
+    );
+
+    const rows =
+      exactRows.length > 0
+        ? exactRows
+        : (
+            await query(
+              `SELECT occasion_id, occasion_name
+               FROM tbl_occasion
+               WHERE active = 1
+                 AND LOWER(occasion_name) LIKE ?
+               ORDER BY occasion_name ASC
+               LIMIT ?`,
+              [`%${escapeLike(normalized)}%`, limit]
+            )
+          )[0];
+
+    return res.status(200).json({
+      message: "Occasion list fetched successfully",
+      occasions: rows
+    });
+
+  } catch (error) {
+    console.error("searchOccasion error:", error);
+    return res.status(500).json({
+      message: "Error searching occasion",
+      error: error.message
+    });
+  }
+};
+
+// get unique businessType list  Api
+const getuniqueBusinessTypes = async (req, res) => {
+  const includeAll = String(req.query?.includeAll ?? '0') === '1';
+  try {
+    const where = ["businessType IS NOT NULL", "TRIM(businessType) <> ''"];
+    if (!includeAll) {
+      where.push('status = 1');
+      where.push('isApproved = 1');
+    }
+
+    const [rows] = await query(
+      `SELECT DISTINCT LOWER(TRIM(businessType)) AS businessType
+       FROM tbl_venue
+       WHERE ${where.join(' AND ')}
+       ORDER BY businessType ASC`
+    );
+
+    return res.status(200).json({
+      message: "Business type list fetched successfully",
+      businessTypes: rows.map(row => row.businessType)
+    });
+  } catch (error) {
+    console.error("getuniqueBusinessTypes error:", error);
+    return res.status(500).json({
+      message: "Error fetching business types",
+      error: error.message
+    });
+  }
+};
+
+// get All citiesList name  Api 
+const getAllCitiesList = async (req, res) => {
+  try {
+    const [rows] = await query('SELECT city_id, city_name FROM tbl_city ORDER BY city_name ASC');
+    return res.status(200).json({ message: 'City list fetched successfully', cityList: rows });
+  } catch (error) {
+    console.error('getAllCitiesList error:', error);
+    return res.status(500).json({ message: 'Error getting city list', error: error.message || String(error) });
+  }
+} 
 module.exports = {
   registerVenue,
   verifyVenueOtp,
@@ -956,5 +1515,13 @@ module.exports = {
   addAmenities,
   getAmenities,
   updateAmenities,
-  deleteAmenities
+  deleteAmenities,
+  getAllVenues,
+  getSimilarVenues,
+  getlatestVenueTypeData,
+  getVenueByCity,
+  getVenuesByOccasion,
+  searchOccasion,
+  getuniqueBusinessTypes,
+  getAllCitiesList,
 };

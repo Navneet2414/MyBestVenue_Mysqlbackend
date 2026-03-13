@@ -9,12 +9,14 @@
     "import:vendors": "node scripts/import_vendors_to_mysql.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.883.0",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.22.1",
     "jsonwebtoken": "^9.0.3",
+    "multer": "^1.4.5-lts.1",
     "mysql2": "^3.17.4"
   },
   "devDependencies": {
