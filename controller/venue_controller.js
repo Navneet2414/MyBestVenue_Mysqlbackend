@@ -4,6 +4,28 @@ const { query, getConnection } = require('../config/db');
 // const { ensureVenuesTable } = require('../models/table_venues');
 const { ensureSpacetypeTable } = require('../models/table_spacetype');
 
+// Lazy-load email service so the rest of the app keeps working even if nodemailer isn't installed yet.
+const getMailer = () => require('../services/emailService');
+
+const sendOtpEmail = async ({ to, otp, purpose }) => {
+  try {
+    const { sendMail } = getMailer();
+    const appName = process.env.APP_NAME || 'MyBestVenue';
+    const title = purpose ? String(purpose) : 'OTP';
+
+    await sendMail({
+      to,
+      subject: `${appName} - ${title}`,
+      text: `Your OTP is ${otp}. It expires in 10 minutes.`,
+      html: `<p>Your OTP is <b>${otp}</b>.</p><p>It expires in 10 minutes.</p>`,
+    });
+    console.log("OTP sent Successfully to:", to);
+  } catch (err) {
+    // Best-effort: don't break existing flows if SMTP isn't configured.
+    console.warn('sendOtpEmail error:', err?.message || err);
+  }
+};
+
 const EMAIL_REGEX = /^[a-zA-Z0-9](\.?[a-zA-Z0-9_-])*@[a-zA-Z0-9-]+(\.[a-zA-Z]{2,})+$/;
 
 const toBoolInt = (value) => {
@@ -59,6 +81,26 @@ const ensureVenueRelationTables = async () => {
       occasion_id INT(11) NOT NULL,
       PRIMARY KEY (id),
       UNIQUE KEY uq_venue_occasion (venue_id, occasion_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+};
+
+const ensureVenueSpacesTable = async () => {
+  await query(`
+    CREATE TABLE IF NOT EXISTS tbl_venue_spaces (
+      space_id INT(11) NOT NULL AUTO_INCREMENT,
+      venue_id INT(11) NOT NULL,
+      space_name VARCHAR(255) NOT NULL,
+      spacetype_id INT(11) DEFAULT NULL,
+      seating_capacity INT(11) DEFAULT 0,
+      floating_capacity INT(11) DEFAULT 0,
+      description TEXT DEFAULT NULL,
+      image VARCHAR(255) DEFAULT NULL,
+      status TINYINT(1) DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (space_id),
+      KEY idx_vs_venue (venue_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 };
@@ -151,6 +193,8 @@ const registerVenue = async (req, res) => {
 
     const [result] = await query(insertSql, params);
 
+    await sendOtpEmail({ to: email, otp, purpose: 'Verify OTP' });
+
     return res.status(201).json({
       message: 'Venue registered successfully. Verify OTP to activate account.',
       id: result.insertId,
@@ -178,12 +222,12 @@ const verifyVenueOtp = async (req, res) => {
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({ message: 'Vendor not found' });
+      return res.status(404).json({ message: 'Venue not found' });
     }
 
     const vendor = rows[0];
     if (Number(vendor.isVerified) === 1) {
-      return res.status(400).json({ message: 'Vendor already verified' });
+      return res.status(400).json({ message: 'Venue already verified' });
     }
 
     const otpMatches = String(otp).trim() === String(vendor.otp || '').trim();
@@ -194,6 +238,19 @@ const verifyVenueOtp = async (req, res) => {
     }
 
     await query('UPDATE tbl_venue SET isVerified = 1, otp = NULL, otpExpires = NULL WHERE venue_id = ?', [vendor.id]);
+
+    try {
+      const { sendMail } = getMailer();
+      const appName = process.env.APP_NAME || 'MyBestVenue';
+      await sendMail({
+        to: email,
+        subject: `${appName} - Account Verified`,
+        text: 'Your account has been verified successfully.',
+        html: '<p>Your account has been verified successfully.</p>',
+      });
+    } catch (err) {
+      console.warn('verifyVenueOtp email error:', err?.message || err);
+    }
 
     return res.status(200).json({
       message: 'Vendor verified successfully',
@@ -238,6 +295,7 @@ const resendVenueOtp = async (req, res) => {
     const otpExpires = Date.now() + 10 * 60 * 1000;
 
     await query('UPDATE tbl_venue SET otp = ?, otpExpires = ? WHERE venue_id = ?', [otp, otpExpires, rows[0].id]);
+    await sendOtpEmail({ to: email, otp, purpose: 'Verify OTP' });
 
     return res.status(200).json({
       message: 'New OTP generated successfully',
@@ -273,6 +331,8 @@ const resendpasswordResetOtp = async (req, res) => {
       [otp, otpExpires, rows[0].id]
     );
 
+    await sendOtpEmail({ to: email, otp, purpose: 'Password Reset OTP' });
+
     return res.status(200).json({
       message: 'Password reset OTP generated successfully',
       otp: process.env.NODE_ENV === 'development' ? otp : undefined,
@@ -280,6 +340,87 @@ const resendpasswordResetOtp = async (req, res) => {
   } catch (error) {
     console.error('resendpasswordResetOtp error:', error);
     return res.status(500).json({ message: 'Error resending password reset OTP', error: error.message || String(error) });
+  }
+};
+
+// Forgot password: generate OTP and send via email (nodemailer).
+const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    if (!email) {
+      return res.status(400).json({ message: 'email is required' });
+    }
+
+    const [rows] = await query('SELECT venue_id AS id, email FROM tbl_venue WHERE email = ? LIMIT 1', [email]);
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'No vendor found with this email' });
+    }
+
+    const otp = generateOtp();
+    const otpExpires = Date.now() + 10 * 60 * 1000;
+
+    await query(
+      'UPDATE tbl_venue SET resetPasswordOtp = ?, resetPasswordOtpExpires = ? WHERE venue_id = ?',
+      [otp, otpExpires, rows[0].id]
+    );
+
+    const { sendMail } = getMailer();
+    await sendMail({
+      to: email,
+      subject: 'Password Reset OTP',
+      text: `Your password reset OTP is ${otp}. It expires in 10 minutes.`,
+      html: `<p>Your password reset OTP is <b>${otp}</b>.</p><p>It expires in 10 minutes.</p>`,
+    });
+
+    return res.status(200).json({
+      message: 'Password reset OTP sent successfully',
+      email,
+      otp: process.env.NODE_ENV === 'development' ? otp : undefined,
+    });
+  } catch (error) {
+    console.error('forgotPassword error:', error);
+    return res.status(500).json({ message: 'Error sending password reset OTP', error: error.message || String(error) });
+  }
+};
+
+// Reset password: verify OTP and update password.
+const resetPassword = async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+
+  try {
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ message: 'email, otp and newPassword are required' });
+    }
+
+    const [rows] = await query(
+      'SELECT venue_id AS id, resetPasswordOtp, resetPasswordOtpExpires FROM tbl_venue WHERE email = ? LIMIT 1',
+      [email]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Vendor not found' });
+    }
+
+    const vendor = rows[0];
+    const otpMatches = String(otp).trim() === String(vendor.resetPasswordOtp || '').trim();
+    const otpExpired = !vendor.resetPasswordOtpExpires || Number(vendor.resetPasswordOtpExpires) < Date.now();
+
+    if (!otpMatches || otpExpired) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    const hashedPassword = await bcrypt.hash(String(newPassword), 12);
+
+    await query(
+      'UPDATE tbl_venue SET password = ?, resetPasswordOtp = NULL, resetPasswordOtpExpires = NULL WHERE venue_id = ?',
+      [hashedPassword, vendor.id]
+    );
+
+    return res.status(200).json({ message: 'Password updated successfully' });
+  } catch (error) {
+    console.error('resetPassword error:', error);
+    return res.status(500).json({ message: 'Error updating password', error: error.message || String(error) });
   }
 };
 
@@ -321,7 +462,7 @@ const loginVenue = async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: vendor.id, email: vendor.email, role: 'venue' },
+      { id: vendor.id, email: vendor.email, },
       process.env.JWT_SECRET,
       { expiresIn: JWT_EXPIRES_IN }
     );
@@ -390,7 +531,7 @@ const updateVenueProfile = async (req, res) => {
 
     setIfPresent('businessName', body.businessName);
     if (body.businessType !== undefined) setIfPresent('businessType', String(body.businessType).toLowerCase());
-    
+
     setIfPresent('contactName', body.contactName);
     setIfPresent('description', body.description);
     setIfPresent('businessExperience', body.businessExperience);
@@ -587,26 +728,26 @@ const getVenueById = async (req, res) => {
       return res.status(400).json({ message: 'Venue ID is required' });
     }
 
-    // await ensureVenuesTable({ query });
-
     const [rows] = await query(
       `SELECT
         v.venue_id AS id, v.businessName, v.businessType, v.contactName, v.email, v.phone,
-        v.businessExperience,
-        v.profilePicture, v.address,
-        v.city_id AS city_id, c.city_name AS city,
-        v.state_id AS state_id, s.state_name AS state,
-        v.country_id AS country_id, co.country_name AS country,
+        v.businessExperience, v.profilePicture, v.address,
+        v.city_id, c.city_name AS city,
+        v.state_id, s.state_name AS state,
+        v.country_id, co.country_name AS country,
         v.pinCode,
         COALESCE(l.locality_name, v.nearLocation) AS nearLocation,
-        v.description, v.status, v.isVerified, v.isApproved, v.isPremium, v.venueCapacity, v.views, v.updatedAt
+        v.description, v.status, v.isVerified, v.isApproved, v.isPremium, v.isTrusted,
+        v.venueCapacity, v.views, v.faqContent, v.metaTitle, v.metaKeywords, v.metaDescription,
+        v.venue_website_url, v.venue_facebook_url, v.venue_instagram_url,
+        v.venue_linkedIn_url, v.venue_youtube_url,
+        v.createdAt, v.updatedAt
        FROM tbl_venue v
        LEFT JOIN tbl_city c ON c.city_id = v.city_id
        LEFT JOIN tbl_state s ON s.state_id = v.state_id
        LEFT JOIN tbl_country co ON co.country_id = v.country_id
        LEFT JOIN tbl_locality l ON v.nearLocation REGEXP '^[0-9]+$' AND l.locality_id = CAST(v.nearLocation AS UNSIGNED)
-       WHERE v.venue_id = ?
-       LIMIT 1`,
+       WHERE v.venue_id = ? LIMIT 1`,
       [vendorId]
     );
 
@@ -614,24 +755,198 @@ const getVenueById = async (req, res) => {
       return res.status(404).json({ message: 'Vendor not found' });
     }
 
-    const vendor = rows[0];
-    const [amenityRows] = await query(
-      `SELECT a.amenity_id, a.amenity_name, a.active
-       FROM tbl_venue_amenities va
-       INNER JOIN tbl_amenities a ON a.amenity_id = va.amenity_id
-       WHERE va.venue_id = ?
-       ORDER BY a.amenity_name ASC`,
-      [vendorId]
-    );
+    const venue = rows[0];
 
-    const [occasionRows] = await query(
-      `SELECT o.occasion_id, o.occasion_name, o.active
-       FROM tbl_venue_occasion vo
-       INNER JOIN tbl_occasion o ON o.occasion_id = vo.occasion_id
-       WHERE vo.venue_id = ?
-       ORDER BY o.occasion_name ASC`,
-      [vendorId]
-    );
+    // Run all related queries in parallel
+    const [
+      [amenities],
+      [occasions],
+      [foodPricing],
+      [rentalPricing],
+      [foodBeverage],
+      [foodCategories],
+      [alcoholPolicy],
+      [entertainmentServices],
+      [staffServices],
+      [dietaryOptions],
+      [services],
+      [additionalServices],
+      [policies],
+      [payment],
+      [paymentMethods],
+      [operatingDetails],
+      [parking],
+      [transportation],
+      [gstDetails],
+      [contacts],
+      [serviceAreas],
+      [images],
+      [videos],
+    ] = await Promise.all([
+      // amenities
+      query(
+        `SELECT a.amenity_id, a.amenity_name
+         FROM tbl_venue_amenities va
+         INNER JOIN tbl_amenities a ON a.amenity_id = va.amenity_id
+         WHERE va.venue_id = ? ORDER BY a.amenity_name ASC`,
+        [vendorId]
+      ),
+      // occasions
+      query(
+        `SELECT o.occasion_id, o.occasion_name
+         FROM tbl_venue_occasion vo
+         INNER JOIN tbl_occasion o ON o.occasion_id = vo.occasion_id
+         WHERE vo.venue_id = ? ORDER BY o.occasion_name ASC`,
+        [vendorId]
+      ),
+      // food pricing (per cuisine)
+      query(
+        `SELECT c.name AS cuisine, vf.price
+         FROM tbl_venue_foodpricing vf
+         INNER JOIN tbl_cuisines c ON c.id = vf.cuisine_id
+         WHERE vf.venue_id = ? ORDER BY c.name ASC`,
+        [vendorId]
+      ),
+      // rental pricing
+      query(
+        `SELECT rt.name AS rental_type, vr.price
+         FROM tbl_venue_rentalpricing vr
+         INNER JOIN tbl_rental_types rt ON rt.id = vr.type_id
+         WHERE vr.venue_id = ? ORDER BY rt.name ASC`,
+        [vendorId]
+      ),
+      // food & beverage policy
+      query(
+        `SELECT catering_policy, soft_drink, beverage_options
+         FROM tbl_venue_food_beverage WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // food categories with price
+      query(
+        `SELECT fct.name AS category, vfc.price
+         FROM tbl_venue_food_category vfc
+         INNER JOIN tbl_food_categories_types fct ON fct.id = vfc.category_id
+         WHERE vfc.venue_id = ? ORDER BY fct.name ASC`,
+        [vendorId]
+      ),
+      // alcohol policy
+      query(
+        `SELECT alcohol_served, outside_liquor_permitted, bar_service_available
+         FROM tbl_venue_alcohol_policy WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // entertainment services
+      query(
+        `SELECT dj_available, live_music_allowed, dance_floor_available, music_system_available
+         FROM tbl_venue_entertainment_services WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // staff services
+      query(
+        `SELECT professional_staff, event_manager, service_staff, security_personnel,
+                waiters, chef_team, housekeeping, technical_support, security, coordinator, cleaning
+         FROM tbl_venue_staff_services WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // dietary options
+      query(
+        `SELECT dt.name AS dietary_type
+         FROM tbl_venue_dietary_options vdo
+         INNER JOIN tbl_dietary_types dt ON dt.id = vdo.dietary_type_id
+         WHERE vdo.venue_id = ? ORDER BY dt.name ASC`,
+        [vendorId]
+      ),
+      // services
+      query(
+        `SELECT s.service_id, s.service_name
+         FROM tbl_venue_service_map vsm
+         INNER JOIN tbl_services s ON s.service_id = vsm.service_id
+         WHERE vsm.venue_id = ? ORDER BY s.service_name ASC`,
+        [vendorId]
+      ),
+      // additional services
+      query(
+        `SELECT ads.service_name, vas.is_available
+         FROM tbl_venue_additional_services vas
+         INNER JOIN tbl_additional_services ads ON ads.id = vas.service_id
+         WHERE vas.venue_id = ? ORDER BY ads.service_name ASC`,
+        [vendorId]
+      ),
+      // policies
+      query(
+        `SELECT booking_policy, cancellation_policy, refund_policy, reschedule_policy,
+                outside_decorator_policy, outside_photographer_policy, terms_conditions, disclaimer
+         FROM tbl_venue_policies WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // payment (advance + method booleans)
+      query(
+        `SELECT advance_payment_required, advance_percentage,
+                cash, upi, bank_transfer, cheque, credit_card
+         FROM tbl_venue_payment WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // payment methods mapping (accepted / not accepted)
+      query(
+        `SELECT pm.method_name, vpm.is_accepted
+         FROM tbl_venue_payment_methods vpm
+         INNER JOIN tbl_payment_methods pm ON pm.id = vpm.payment_method_id
+         WHERE vpm.venue_id = ? ORDER BY pm.id ASC`,
+        [vendorId]
+      ),
+      // operating details & slots
+      query(
+        `SELECT open_time, close_time, operating_days,
+                slot_morning, slot_evening, slot_full_day
+         FROM tbl_venue_operating_details WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // parking
+      query(
+        `SELECT two_wheeler, four_wheeler, total_capacity, available_capacity, is_free, price_per_hour
+         FROM table_venue_parking WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // transportation
+      query(
+        `SELECT mode, name, distance
+         FROM table_venue_transportation WHERE venue_id = ? ORDER BY id ASC`,
+        [vendorId]
+      ),
+      // GST details
+      query(
+        `SELECT gst_number, gst_document, gst_verified
+         FROM tbl_venue_gst_details WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // contacts
+      query(
+        `SELECT manager_name, manager_number1, manager_number2,
+                owner_name, owner_number1, owner_number2,
+                accountant_name, accountant_number1, accountant_number2
+         FROM table_venue_contacts WHERE venue_id = ? LIMIT 1`,
+        [vendorId]
+      ),
+      // service areas
+      query(
+        `SELECT city_id, city_name
+         FROM tbl_venue_service_areas_cities
+         WHERE venue_id = ? ORDER BY city_name ASC`,
+        [vendorId]
+      ),
+      // images
+      query(
+        `SELECT image_url, title, display_order
+         FROM tbl_venue_images WHERE venue_id = ? ORDER BY display_order ASC`,
+        [vendorId]
+      ),
+      // videos
+      query(
+        `SELECT video_url, title, display_order
+         FROM tbl_venue_videos WHERE venue_id = ? ORDER BY display_order ASC`,
+        [vendorId]
+      ),
+    ]);
 
     const slug = (value, fallback) =>
       String(value || fallback)
@@ -640,15 +955,36 @@ const getVenueById = async (req, res) => {
         .trim()
         .replace(/\s+/g, '-');
 
-    const seoUrl = `/${slug(vendor.city, 'location')}/${slug(vendor.businessType, 'vendor')}/${slug(vendor.businessName, 'business')}-in-${slug(vendor.nearLocation, 'area')}`;
+    const seoUrl = `/${slug(venue.city, 'location')}/${slug(venue.businessType, 'vendor')}/${slug(venue.businessName, 'business')}-in-${slug(venue.nearLocation, 'area')}`;
 
     return res.status(200).json({
       message: 'Venue found successfully',
       venue: {
-        ...vendor,
+        ...venue,
         seoUrl,
-        amenities: amenityRows,
-        occasions: occasionRows,
+        amenities,
+        occasions,
+        food_pricing: foodPricing,
+        rental_pricing: rentalPricing,
+        food_beverage: foodBeverage[0] || null,
+        food_categories: foodCategories,
+        alcohol_policy: alcoholPolicy[0] || null,
+        entertainment_services: entertainmentServices[0] || null,
+        staff_services: staffServices[0] || null,
+        dietary_options: dietaryOptions,
+        services,
+        additional_services: additionalServices,
+        policies: policies[0] || null,
+        payment: payment[0] || null,
+        payment_methods: paymentMethods,
+        operating_details: operatingDetails[0] || null,
+        parking: parking[0] || null,
+        transportation,
+        gst_details: gstDetails[0] || null,
+        contacts: contacts[0] || null,
+        images,
+        videos,
+        service_areas: serviceAreas,
       },
     });
   } catch (error) {
@@ -771,7 +1107,7 @@ const addOccassions = async (req, res) => {
     return res.status(500).json({ message: 'Error adding occasion', error: error.message || String(error) });
   }
 };
-    
+
 // Get occassion List Api
 const getOccassions = async (req, res) => {
   try {
@@ -788,7 +1124,7 @@ const updateOccassions = async (req, res) => {
   const { occasionName } = req.body;
 
   try {
-  
+
 
     if (!occasionName) {
       return res.status(400).json({ message: 'Occasion name is required' });
@@ -812,7 +1148,7 @@ const updateOccassions = async (req, res) => {
 };
 
 // Delete occassions 
-const  deleteOccassions = async (req,res)=> {
+const deleteOccassions = async (req, res) => {
   const { occasionId } = req.params;
 
   try {
@@ -1101,8 +1437,8 @@ const getSimilarVenues = async (req, res) => {
 
 // Get Latest venue by cityId and businessType Api
 const getlatestVenueTypeData = async (req, res) => {
-  const cityIdRaw =  req.query?.cityId;
-  const businessTypeRaw = req.query?.businessType ;
+  const cityIdRaw = req.query?.cityId;
+  const businessTypeRaw = req.query?.businessType;
   const limitRaw = Number(req.query?.limit ?? 20);
   const pageRaw = Number(req.query?.page ?? 1);
   const includeAll = String(req.query?.includeAll ?? '0') === '1';
@@ -1430,16 +1766,16 @@ const searchOccasion = async (req, res) => {
       exactRows.length > 0
         ? exactRows
         : (
-            await query(
-              `SELECT occasion_id, occasion_name
+          await query(
+            `SELECT occasion_id, occasion_name
                FROM tbl_occasion
                WHERE active = 1
                  AND LOWER(occasion_name) LIKE ?
                ORDER BY occasion_name ASC
                LIMIT ?`,
-              [`%${escapeLike(normalized)}%`, limit]
-            )
-          )[0];
+            [`%${escapeLike(normalized)}%`, limit]
+          )
+        )[0];
 
     return res.status(200).json({
       message: "Occasion list fetched successfully",
@@ -1494,12 +1830,274 @@ const getAllCitiesList = async (req, res) => {
     console.error('getAllCitiesList error:', error);
     return res.status(500).json({ message: 'Error getting city list', error: error.message || String(error) });
   }
-} 
+}
+
+
+// Add Venue Spaces of Particular Venue
+const addVenueSpaces = async (req, res) => {
+  const venueId = req.params.id;
+
+  const {
+    space_name,
+    space_type,
+    min_capacity,
+    max_capacity,
+    veg_price,
+    veg_imfl_price,
+    non_veg_price,
+    non_veg_imfl_price,
+
+    cuisine_indian,
+    cuisine_chinese,
+    cuisine_mughlai,
+    cuisine_continental,
+    cuisine_tandoori,
+    cuisine_south_indian,
+    cuisine_north_indian,
+    cuisine_italian,
+    cuisine_mexican,
+
+    contact_name,
+    contact_number,
+    city_id,
+    pin_code,
+    near_location_id,
+    address,
+    is_active
+  } = req.body;
+
+  const profile_picture = req.imageUrl || null;
+
+  try {
+    if (!venueId) {
+      return res.status(400).json({ message: 'Venue ID is required' });
+    }
+
+    if (!space_name) {
+      return res.status(400).json({ message: 'Space name is required' });
+    }
+
+    const insertSql = `
+      INSERT INTO tbl_venue_spaces (
+        venue_id, space_name, space_type,
+        min_capacity, max_capacity,
+        veg_price, veg_imfl_price, non_veg_price, non_veg_imfl_price,
+        cuisine_indian, cuisine_chinese, cuisine_mughlai, cuisine_continental,
+        cuisine_tandoori, cuisine_south_indian, cuisine_north_indian,
+        cuisine_italian, cuisine_mexican,
+        contact_name, contact_number,
+        city_id, pin_code, near_location_id,
+        address, profile_picture, is_active
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    const values = [
+      venueId,
+      space_name,
+      space_type || 'Indoor',
+      min_capacity || null,
+      max_capacity || null,
+      veg_price || null,
+      veg_imfl_price || null,
+      non_veg_price || null,
+      non_veg_imfl_price || null,
+
+      cuisine_indian ? 1 : 0,
+      cuisine_chinese ? 1 : 0,
+      cuisine_mughlai ? 1 : 0,
+      cuisine_continental ? 1 : 0,
+      cuisine_tandoori ? 1 : 0,
+      cuisine_south_indian ? 1 : 0,
+      cuisine_north_indian ? 1 : 0,
+      cuisine_italian ? 1 : 0,
+      cuisine_mexican ? 1 : 0,
+
+      contact_name || null,
+      contact_number || null,
+      city_id || null,
+      pin_code || null,
+      near_location_id || null,
+      address || null,
+      profile_picture,
+      is_active !== undefined ? is_active : 1
+    ];
+
+    const [result] = await query(insertSql, values);
+
+    // ✅ Fetch inserted record
+    const [rows] = await query(
+      `SELECT * FROM tbl_venue_spaces WHERE space_id = ?`,
+      [result.insertId]
+    );
+
+    return res.status(201).json({
+      message: 'Venue space added successfully',
+      data: rows[0]
+    });
+
+  } catch (error) {
+    console.error('addVenueSpaces error:', error);
+    return res.status(500).json({
+      message: 'Error adding venue space',
+      error: error.message || String(error)
+    });
+  }
+};
+
+// Get Venue Spaces of Particular Venue
+const getVenueSpaces = async (req, res) => {
+  const venueId = req.params.id;
+  try {
+    if (!venueId) return res.status(400).json({ message: 'Venue ID is required' });
+
+    await ensureVenueSpacesTable();
+
+    const [rows] = await query(`
+      SELECT * FROM tbl_venue_spaces
+      WHERE venue_id = ?
+      ORDER BY space_id DESC
+    `, [venueId]);
+
+    return res.status(200).json({ message: 'Venue spaces fetched successfully', spaces: rows });
+  } catch (error) {
+    console.error('getVenueSpaces error:', error);
+    return res.status(500).json({ message: 'Error fetching venue spaces', error: error.message || String(error) });
+  }
+};
+
+
+// Update Venue Spaces of Particular Venue
+const updateVenueSpace = async (req, res) => {
+  const spaceId = req.params.spaceId;
+
+  const {
+    space_name,
+    space_type,
+    min_capacity,
+    max_capacity,
+    veg_price,
+    veg_imfl_price,
+    non_veg_price,
+    non_veg_imfl_price,
+
+    cuisine_indian,
+    cuisine_chinese,
+    cuisine_mughlai,
+    cuisine_continental,
+    cuisine_tandoori,
+    cuisine_south_indian,
+    cuisine_north_indian,
+    cuisine_italian,
+    cuisine_mexican,
+
+    contact_name,
+    contact_number,
+    city_id,
+    pin_code,
+    near_location_id,
+    address,
+    is_active
+  } = req.body;
+
+  const profile_picture = req.imageUrl;
+
+  try {
+    if (!spaceId) {
+      return res.status(400).json({ message: 'Space ID is required' });
+    }
+
+    const fields = [];
+    const values = [];
+
+    // ✅ Basic fields
+    if (space_name !== undefined) { fields.push('space_name = ?'); values.push(space_name); }
+    if (space_type !== undefined) { fields.push('space_type = ?'); values.push(space_type); }
+    if (min_capacity !== undefined) { fields.push('min_capacity = ?'); values.push(min_capacity); }
+    if (max_capacity !== undefined) { fields.push('max_capacity = ?'); values.push(max_capacity); }
+
+    // ✅ Pricing
+    if (veg_price !== undefined) { fields.push('veg_price = ?'); values.push(veg_price); }
+    if (veg_imfl_price !== undefined) { fields.push('veg_imfl_price = ?'); values.push(veg_imfl_price); }
+    if (non_veg_price !== undefined) { fields.push('non_veg_price = ?'); values.push(non_veg_price); }
+    if (non_veg_imfl_price !== undefined) { fields.push('non_veg_imfl_price = ?'); values.push(non_veg_imfl_price); }
+
+    // ✅ Cuisine flags
+    if (cuisine_indian !== undefined) { fields.push('cuisine_indian = ?'); values.push(cuisine_indian ? 1 : 0); }
+    if (cuisine_chinese !== undefined) { fields.push('cuisine_chinese = ?'); values.push(cuisine_chinese ? 1 : 0); }
+    if (cuisine_mughlai !== undefined) { fields.push('cuisine_mughlai = ?'); values.push(cuisine_mughlai ? 1 : 0); }
+    if (cuisine_continental !== undefined) { fields.push('cuisine_continental = ?'); values.push(cuisine_continental ? 1 : 0); }
+    if (cuisine_tandoori !== undefined) { fields.push('cuisine_tandoori = ?'); values.push(cuisine_tandoori ? 1 : 0); }
+    if (cuisine_south_indian !== undefined) { fields.push('cuisine_south_indian = ?'); values.push(cuisine_south_indian ? 1 : 0); }
+    if (cuisine_north_indian !== undefined) { fields.push('cuisine_north_indian = ?'); values.push(cuisine_north_indian ? 1 : 0); }
+    if (cuisine_italian !== undefined) { fields.push('cuisine_italian = ?'); values.push(cuisine_italian ? 1 : 0); }
+    if (cuisine_mexican !== undefined) { fields.push('cuisine_mexican = ?'); values.push(cuisine_mexican ? 1 : 0); }
+
+    // ✅ Contact & Location
+    if (contact_name !== undefined) { fields.push('contact_name = ?'); values.push(contact_name); }
+    if (contact_number !== undefined) { fields.push('contact_number = ?'); values.push(contact_number); }
+    if (city_id !== undefined) { fields.push('city_id = ?'); values.push(city_id); }
+    if (pin_code !== undefined) { fields.push('pin_code = ?'); values.push(pin_code); }
+    if (near_location_id !== undefined) { fields.push('near_location_id = ?'); values.push(near_location_id); }
+    if (address !== undefined) { fields.push('address = ?'); values.push(address); }
+
+    // ✅ Image
+    if (profile_picture) { fields.push('profile_picture = ?'); values.push(profile_picture); }
+
+    // ✅ Status
+    if (is_active !== undefined) { fields.push('is_active = ?'); values.push(is_active); }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    values.push(spaceId);
+
+    const sql = `UPDATE tbl_venue_spaces SET ${fields.join(', ')} WHERE space_id = ?`;
+
+    await query(sql, values);
+
+    // ✅ Return updated data
+    const [rows] = await query(
+      `SELECT * FROM tbl_venue_spaces WHERE space_id = ?`,
+      [spaceId]
+    );
+
+    return res.status(200).json({
+      message: 'Venue space updated successfully',
+      data: rows[0]
+    });
+
+  } catch (error) {
+    console.error('updateVenueSpace error:', error);
+    return res.status(500).json({
+      message: 'Error updating venue space',
+      error: error.message || String(error)
+    });
+  }
+};
+
+// Delete Venue Spaces of Particular Venue
+const deleteVenueSpace = async (req, res) => {
+  const spaceId = req.params.spaceId;
+  try {
+    if (!spaceId) return res.status(400).json({ message: 'Space ID is required' });
+
+    await query('DELETE FROM tbl_venue_spaces WHERE space_id = ?', [spaceId]);
+    return res.status(200).json({ message: 'Venue space deleted successfully' });
+  } catch (error) {
+    console.error('deleteVenueSpace error:', error);
+    return res.status(500).json({ message: 'Error deleting venue space', error: error.message || String(error) });
+  }
+};
+
 module.exports = {
   registerVenue,
   verifyVenueOtp,
   resendVenueOtp,
   resendpasswordResetOtp,
+  forgotPassword,
+  resetPassword,
   loginVenue,
   getVenueById,
   updateVenueProfile,
@@ -1524,4 +2122,8 @@ module.exports = {
   searchOccasion,
   getuniqueBusinessTypes,
   getAllCitiesList,
+  addVenueSpaces,
+  getVenueSpaces,
+  updateVenueSpace,
+  deleteVenueSpace
 };
