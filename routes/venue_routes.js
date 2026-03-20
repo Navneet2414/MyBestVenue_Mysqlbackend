@@ -7,6 +7,8 @@ router.post('/register', uploadVenueProfilePictureToS3, venueController.register
 router.post('/verify-otp', venueController.verifyVenueOtp);
 router.post('/resend-otp', venueController.resendVenueOtp);
 router.post('/resend-password-reset-otp', venueController.resendpasswordResetOtp);
+router.post('/forgot-password', venueController.forgotPassword);
+router.post('/reset-password', venueController.resetPassword);
 router.post('/login', venueController.loginVenue);
 router.get('/list', venueController.getAllVenues);
 router.get('/getVenueByCity/:cityId', venueController.getVenueByCity);
@@ -54,10 +56,10 @@ router.get('/unique-business-types', venueController.getuniqueBusinessTypes);
 
 
 
-// 
-
-
-
-
+// venue spaces
+router.post('/create-venue-spaces/:id', uploadVenueProfilePictureToS3, venueController.addVenueSpaces);
+router.get('/venue-spaces/:id', venueController.getVenueSpaces);
+router.put('/venue-spaces/update/:spaceId', uploadVenueProfilePictureToS3, venueController.updateVenueSpace);
+router.delete('/venue-spaces/delete/:spaceId', venueController.deleteVenueSpace);
 
 module.exports = router;
