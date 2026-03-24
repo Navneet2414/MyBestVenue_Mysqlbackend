@@ -855,3 +855,23 @@ CREATE TABLE IF NOT EXISTS `tbl_venue_spaces` (
     FOREIGN KEY (`state_id`) REFERENCES `tbl_state`(`state_id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+
+#
+# Structure for table tbl_venue_faqs
+#
+CREATE TABLE IF NOT EXISTS `tbl_venue_faqs` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `venue_id` BIGINT UNSIGNED NOT NULL,
+
+    `question` VARCHAR(500) NOT NULL,
+    `answer` TEXT NOT NULL,
+
+    `status` TINYINT(1) DEFAULT 1 COMMENT '1=active, 0=inactive',
+
+    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT `fk_faqs_venue`
+    FOREIGN KEY (`venue_id`) REFERENCES `tbl_venue`(`venue_id`)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

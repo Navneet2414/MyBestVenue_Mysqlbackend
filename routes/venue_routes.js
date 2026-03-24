@@ -2,6 +2,9 @@ const express = require('express');
 const router = express.Router();
 const venueController = require('../controller/venue_controller');
 const { uploadVenueProfilePictureToS3 } = require('../middlewares/upload_profile_picture_s3');
+const { uploadPortfolioImageToS3 } = require('../middlewares/upload_portfolio_s3');
+const { uploadPortfolioVideoToS3 } = require('../middlewares/upload_portfolio_video_s3');
+const { anyAuth } = require('../middlewares/auth');
 
 router.post('/register', uploadVenueProfilePictureToS3, venueController.registerVenue);
 router.post('/verify-otp', venueController.verifyVenueOtp);
@@ -18,6 +21,35 @@ router.get('/similar/:id', venueController.getSimilarVenues);
 router.get('/get-venue-details/:id', venueController.getVenueById);
 router.put('/update-venue-details/:id', uploadVenueProfilePictureToS3, venueController.updateVenueProfile);
 router.delete('/delete-venue/:id', venueController.deleteVenue);
+
+// portfolio images (tbl_venue_images)
+router.post('/portfolio/images', anyAuth, uploadPortfolioImageToS3, venueController.uploadPortfolioImage);
+router.get('/portfolio/images/:venueId', venueController.getPortfolioImages);
+router.delete('/portfolio/images/:imageId', anyAuth, venueController.deletePortfolioImage);
+
+// portfolio videos (tbl_venue_videos)
+router.post('/portfolio/videos', anyAuth, uploadPortfolioVideoToS3, venueController.uploadPortfolioVideo);
+router.get('/portfolio/videos/:venueId', venueController.getPortfolioVideos);
+router.delete('/portfolio/videos/:videoId', anyAuth, venueController.deletePortfolioVideo);
+
+// transportation (table_venue_transportation)
+router.delete('/transportation/:transportationId', anyAuth, venueController.deleteVenueTransportation);
+
+// policies (tbl_venue_policies)
+router.post('/policies', anyAuth, venueController.upsertVenuePolicies);
+router.put('/policies', anyAuth, venueController.upsertVenuePolicies);
+router.delete('/policies', anyAuth, venueController.deleteVenuePolicies);
+
+// service packages (tbl_venue_service_packages)
+router.post('/service-packages', anyAuth, venueController.createVenueServicePackages);
+router.put('/service-packages/:packageId', anyAuth, venueController.updateVenueServicePackage);
+router.delete('/service-packages/:packageId', anyAuth, venueController.deleteVenueServicePackage);
+
+// faqs (tbl_venue_faqs)
+router.get('/faqs/:venueId', venueController.getVenueFaqs);
+router.post('/faqs', anyAuth, venueController.createVenueFaqs);
+router.put('/faqs/:faqId', anyAuth, venueController.updateVenueFaq);
+router.delete('/faqs/:faqId', anyAuth, venueController.deleteVenueFaq);
 
 // country ,state, city
 router.get('/countries', venueController.getCountryList);
@@ -54,12 +86,12 @@ router.get('/getVenuesByOccasion/:occasionId', venueController.getVenuesByOccasi
 // get unique business types
 router.get('/unique-business-types', venueController.getuniqueBusinessTypes);
 
-
-
 // venue spaces
 router.post('/create-venue-spaces/:id', uploadVenueProfilePictureToS3, venueController.addVenueSpaces);
 router.get('/venue-spaces/:id', venueController.getVenueSpaces);
 router.put('/venue-spaces/update/:spaceId', uploadVenueProfilePictureToS3, venueController.updateVenueSpace);
 router.delete('/venue-spaces/delete/:spaceId', venueController.deleteVenueSpace);
+
+
 
 module.exports = router;
