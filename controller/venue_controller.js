@@ -37,6 +37,20 @@ const toBoolInt = (value) => {
 const generateOtp = () => Math.floor(100000 + Math.random() * 900000).toString();
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
+const parsePositiveInt = (value) => {
+  const num = Number(String(value ?? '').trim());
+  if (!Number.isFinite(num)) return null;
+  const intVal = Math.trunc(num);
+  return intVal > 0 ? intVal : null;
+};
+
+const parseNonNegativeInt = (value) => {
+  const num = Number(String(value ?? '').trim());
+  if (!Number.isFinite(num)) return null;
+  const intVal = Math.trunc(num);
+  return intVal >= 0 ? intVal : null;
+};
+
 const ensureOccasionsTable = async () => {
   await query(`
     CREATE TABLE IF NOT EXISTS tbl_occasion (
@@ -109,12 +123,248 @@ const parseIdList = (value) => {
   if (value === undefined) return null;
   if (value === null) return [];
 
-  const arr = Array.isArray(value) ? value : String(value).split(',');
+  let normalized = value;
+  if (typeof normalized === 'string') {
+    const trimmed = normalized.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) normalized = parsed;
+      } catch (_) {
+        // keep original string
+      }
+    }
+  }
+
+  const arr = Array.isArray(normalized) ? normalized : String(normalized).split(',');
   const ids = arr
     .map((v) => Number(String(v).trim()))
     .filter((n) => Number.isInteger(n) && n > 0);
 
   return [...new Set(ids)];
+};
+
+const parseFlexibleIdList = (value) => {
+  if (value === undefined) return null;
+  if (value === null) return [];
+
+  let normalized = value;
+  if (typeof normalized === 'string') {
+    const trimmed = normalized.trim();
+    if (
+      (trimmed.startsWith('[') && trimmed.endsWith(']')) ||
+      (trimmed.startsWith('{') && trimmed.endsWith('}'))
+    ) {
+      try {
+        normalized = JSON.parse(trimmed);
+      } catch (_) {
+        // keep original string
+      }
+    }
+  }
+
+  if (Array.isArray(normalized)) {
+    const extracted = normalized.map((item) => {
+      if (item && typeof item === 'object') {
+        return (
+          item.id ??
+          item.city_id ??
+          item.cityId ??
+          item.service_id ??
+          item.serviceId ??
+          item.amenity_id ??
+          item.amenityId ??
+          item.occasion_id ??
+          item.occasionId
+        );
+      }
+      return item;
+    });
+    return parseIdList(extracted);
+  }
+
+  if (normalized && typeof normalized === 'object') {
+    const candidate =
+      normalized.ids ??
+      normalized.id ??
+      normalized.city_id ??
+      normalized.cityId ??
+      normalized.service_ids ??
+      normalized.serviceIds;
+
+    if (candidate !== undefined) return parseFlexibleIdList(candidate);
+  }
+
+  return parseIdList(normalized);
+};
+
+const parseFoodPricingInput = (value) => {
+  if (value === undefined) return null;
+  if (value === null) return [];
+
+  let normalized = value;
+  if (typeof normalized === 'string') {
+    const trimmed = normalized.trim();
+    if (
+      (trimmed.startsWith('[') && trimmed.endsWith(']')) ||
+      (trimmed.startsWith('{') && trimmed.endsWith('}'))
+    ) {
+      try {
+        normalized = JSON.parse(trimmed);
+      } catch (_) {
+        // keep original string
+      }
+    }
+  }
+
+  const items = [];
+
+  if (Array.isArray(normalized)) {
+    for (const entry of normalized) {
+      if (!entry || typeof entry !== 'object') return { ok: false, message: 'Invalid food pricing format' };
+
+      const cuisineId = entry.cuisine_id ?? entry.cuisineId ?? entry.id ?? null;
+      const cuisineName = entry.cuisine ?? entry.name ?? null;
+      const rawPrice = entry.price ?? entry.amount ?? null;
+
+      const price = parseNonNegativeInt(rawPrice);
+      if (price === null) return { ok: false, message: 'Invalid cuisine price' };
+
+      if (cuisineId !== null && cuisineId !== undefined) {
+        const id = parsePositiveInt(cuisineId);
+        if (!id) return { ok: false, message: 'Invalid cuisine ID' };
+        items.push({ cuisine_id: id, price });
+        continue;
+      }
+
+      if (cuisineName) {
+        items.push({ cuisine_name: String(cuisineName).trim(), price });
+        continue;
+      }
+
+      return { ok: false, message: 'Cuisine ID or name is required for food pricing' };
+    }
+
+    return { ok: true, items };
+  }
+
+  if (normalized && typeof normalized === 'object') {
+    for (const [key, rawPrice] of Object.entries(normalized)) {
+      const price = parseNonNegativeInt(rawPrice);
+      if (price === null) return { ok: false, message: 'Invalid cuisine price' };
+
+      const maybeId = parsePositiveInt(key);
+      if (maybeId) {
+        items.push({ cuisine_id: maybeId, price });
+      } else {
+        items.push({ cuisine_name: String(key).trim(), price });
+      }
+    }
+
+    return { ok: true, items };
+  }
+
+  return { ok: false, message: 'Invalid food pricing format' };
+};
+
+const parseTransportationInput = (value) => {
+  if (value === undefined) return null;
+  if (value === null) return { ok: true, items: [] };
+
+  let normalized = value;
+  if (typeof normalized === 'string') {
+    const trimmed = normalized.trim();
+    if (
+      (trimmed.startsWith('[') && trimmed.endsWith(']')) ||
+      (trimmed.startsWith('{') && trimmed.endsWith('}'))
+    ) {
+      try {
+        normalized = JSON.parse(trimmed);
+      } catch (_) {
+        return { ok: false, message: 'Invalid transportation format' };
+      }
+    } else {
+      return { ok: false, message: 'Invalid transportation format' };
+    }
+  }
+
+  if (!Array.isArray(normalized)) return { ok: false, message: 'Invalid transportation format' };
+
+  const items = [];
+  for (const entry of normalized) {
+    if (!entry || typeof entry !== 'object') return { ok: false, message: 'Invalid transportation format' };
+
+    const modeRaw = entry.mode ?? entry.type ?? null;
+    const nameRaw = entry.name ?? entry.station ?? entry.place ?? null;
+    const distanceRaw = entry.distance ?? entry.km ?? entry.distance_km ?? null;
+
+    const mode = modeRaw === null || modeRaw === undefined ? null : String(modeRaw).trim() || null;
+    const name = nameRaw === null || nameRaw === undefined ? null : String(nameRaw).trim() || null;
+
+    let distance = null;
+    if (distanceRaw !== null && distanceRaw !== undefined && String(distanceRaw).trim() !== '') {
+      const n = Number(String(distanceRaw).trim());
+      if (!Number.isFinite(n) || n < 0) return { ok: false, message: 'Invalid transportation distance' };
+      distance = Math.round(n * 100) / 100;
+    }
+
+    if (!mode && !name && distance === null) continue;
+
+    items.push({ mode, name, distance });
+  }
+
+  return { ok: true, items };
+};
+
+const normalizeCsvTextList = (value) => {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+
+  let normalized = value;
+  if (typeof normalized === 'string') {
+    const trimmed = normalized.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        normalized = parsed;
+      } catch (_) {
+        // treat as normal csv string
+        normalized = trimmed;
+      }
+    } else {
+      normalized = trimmed;
+    }
+  }
+
+  let items;
+  if (Array.isArray(normalized)) {
+    items = normalized.map((v) => String(v ?? '').trim());
+  } else {
+    items = String(normalized ?? '')
+      .split(',')
+      .map((v) => String(v).trim());
+  }
+
+  const toSlug = (text) =>
+    String(text || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .replace(/_+/g, '_');
+
+  items = items.map(toSlug).filter(Boolean);
+  if (items.length === 0) return null;
+
+  const seen = new Set();
+  const deduped = [];
+  for (const slug of items) {
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    deduped.push(slug);
+  }
+
+  return deduped.join(',');
 };
 
 const registerVenue = async (req, res) => {
@@ -462,7 +712,7 @@ const loginVenue = async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: vendor.id, email: vendor.email, },
+      { id: vendor.id, email: vendor.email, role: 'venue' },
       process.env.JWT_SECRET,
       { expiresIn: JWT_EXPIRES_IN }
     );
@@ -491,6 +741,1182 @@ const loginVenue = async (req, res) => {
   }
 };
 
+// Portfolio Images (tbl_venue_images)
+const uploadPortfolioImage = async (req, res) => {
+  try {
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId =
+        parsePositiveInt(req.body?.venueId ?? req.query?.venueId) || null;
+    } else {
+      // Venues can only upload to their own portfolio (ignore any passed venueId)
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const uploadedFiles = Array.isArray(req.uploadedFiles) && req.uploadedFiles.length > 0 ? req.uploadedFiles : null;
+    const fileUrls = Array.isArray(req.fileUrls) && req.fileUrls.length > 0 ? req.fileUrls : null;
+    const singleFileUrl = req.fileUrl ? String(req.fileUrl) : '';
+
+    const totalUploads = uploadedFiles?.length || fileUrls?.length || (singleFileUrl ? 1 : 0);
+    if (!totalUploads) {
+      return res.status(400).json({ success: false, message: 'No image uploaded' });
+    }
+
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Venue ID is required' });
+    }
+
+    const [venueRows] = await query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const [statsRows] = await query(
+      'SELECT COALESCE(MAX(display_order), -1) AS maxOrder, COUNT(*) AS total FROM tbl_venue_images WHERE venue_id = ?',
+      [venueId]
+    );
+    const currentTotal = Number(statsRows?.[0]?.total || 0);
+    const nextOrder = Number(statsRows?.[0]?.maxOrder || -1) + 1;
+
+    const description = String(req.body?.description || '').trim();
+
+    const uploads = uploadedFiles
+      ? uploadedFiles.map((f) => ({ url: f.url, originalName: f.originalName }))
+      : fileUrls
+        ? fileUrls.map((u) => ({ url: u, originalName: '' }))
+        : [{ url: singleFileUrl, originalName: req.file?.originalname || '' }];
+
+    if (uploads.length > 8) {
+      return res.status(400).json({ success: false, message: 'Maximum 8 images allowed' });
+    }
+
+    const insertedImages = [];
+    for (let idx = 0; idx < uploads.length; idx += 1) {
+      const uploadItem = uploads[idx];
+      const originalName = String(uploadItem.originalName || '').trim();
+      const baseName = originalName ? originalName.replace(/\.[^/.]+$/, '') : '';
+      const title = baseName || `Portfolio Image ${currentTotal + idx + 1}`;
+      const displayOrder = nextOrder + idx;
+
+      const [result] = await query(
+        'INSERT INTO tbl_venue_images (venue_id, image_url, title, description, display_order) VALUES (?, ?, ?, ?, ?)',
+        [venueId, uploadItem.url, title, description || null, displayOrder]
+      );
+
+      const [imageRows] = await query(
+        'SELECT image_id, venue_id, image_url AS url, title, description, display_order, createdAt FROM tbl_venue_images WHERE image_id = ? LIMIT 1',
+        [result.insertId]
+      );
+
+      if (imageRows?.[0]) insertedImages.push(imageRows[0]);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Portfolio image uploaded successfully',
+      images: insertedImages,
+    });
+  } catch (error) {
+    console.error('uploadPortfolioImage error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error during portfolio image upload',
+      error: error.message || String(error),
+    });
+  }
+};
+
+const getPortfolioImages = async (req, res) => {
+  try {
+    const venueId = parsePositiveInt(req.params.venueId);
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Invalid venue ID' });
+    }
+
+    const [venueRows] = await query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const [rows] = await query(
+      `SELECT image_id, image_url AS url, title, description, display_order, createdAt
+       FROM tbl_venue_images
+       WHERE venue_id = ?
+       ORDER BY display_order ASC, image_id ASC`,
+      [venueId]
+    );
+
+    return res.status(200).json({ success: true, images: rows || [] });
+  } catch (error) {
+    console.error('getPortfolioImages error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  }
+};
+
+const deletePortfolioImage = async (req, res) => {
+  try {
+    const imageId = parsePositiveInt(req.params.imageId);
+    if (!imageId) {
+      return res.status(400).json({ success: false, message: 'Invalid image ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const [imageRows] = await query(
+      'SELECT image_id, venue_id, image_url, title, description, display_order, createdAt FROM tbl_venue_images WHERE image_id = ? LIMIT 1',
+      [imageId]
+    );
+
+    if (!imageRows || imageRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Image not found' });
+    }
+
+    const image = imageRows[0];
+    if (venueId && Number(image.venue_id) !== Number(venueId)) {
+      return res.status(403).json({ success: false, message: 'You do not have access to delete this image' });
+    }
+
+    await query('DELETE FROM tbl_venue_images WHERE image_id = ?', [imageId]);
+
+    return res.status(200).json({ success: true, message: 'Image deleted successfully', deletedImage: image });
+  } catch (error) {
+    console.error('deletePortfolioImage error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  }
+};
+
+// Portfolio Videos (tbl_venue_videos)
+const uploadPortfolioVideo = async (req, res) => {
+  try {
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.body?.venueId ?? req.query?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const uploadedFiles = Array.isArray(req.uploadedFiles) && req.uploadedFiles.length > 0 ? req.uploadedFiles : null;
+    const fileUrls = Array.isArray(req.fileUrls) && req.fileUrls.length > 0 ? req.fileUrls : null;
+    const singleFileUrl = req.fileUrl ? String(req.fileUrl) : '';
+
+    const totalUploads = uploadedFiles?.length || fileUrls?.length || (singleFileUrl ? 1 : 0);
+    if (!totalUploads) {
+      return res.status(400).json({ success: false, message: 'No video uploaded' });
+    }
+
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Venue ID is required' });
+    }
+
+    const [venueRows] = await query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const [statsRows] = await query(
+      'SELECT COALESCE(MAX(display_order), -1) AS maxOrder, COUNT(*) AS total FROM tbl_venue_videos WHERE venue_id = ?',
+      [venueId]
+    );
+    const currentTotal = Number(statsRows?.[0]?.total || 0);
+    const nextOrder = Number(statsRows?.[0]?.maxOrder || -1) + 1;
+
+    const description = String(req.body?.description || '').trim();
+
+    const uploads = uploadedFiles
+      ? uploadedFiles.map((f) => ({ url: f.url, originalName: f.originalName }))
+      : fileUrls
+        ? fileUrls.map((u) => ({ url: u, originalName: '' }))
+        : [{ url: singleFileUrl, originalName: req.file?.originalname || '' }];
+
+    if (uploads.length > 8) {
+      return res.status(400).json({ success: false, message: 'Maximum 8 videos allowed' });
+    }
+
+    const insertedVideos = [];
+    for (let idx = 0; idx < uploads.length; idx += 1) {
+      const uploadItem = uploads[idx];
+      const originalName = String(uploadItem.originalName || '').trim();
+      const baseName = originalName ? originalName.replace(/\.[^/.]+$/, '') : '';
+      const title = baseName || `Portfolio Video ${currentTotal + idx + 1}`;
+      const displayOrder = nextOrder + idx;
+
+      const [result] = await query(
+        'INSERT INTO tbl_venue_videos (venue_id, video_url, title, description, display_order) VALUES (?, ?, ?, ?, ?)',
+        [venueId, uploadItem.url, title, description || null, displayOrder]
+      );
+
+      const [videoRows] = await query(
+        'SELECT video_id, venue_id, video_url AS url, title, description, display_order, createdAt FROM tbl_venue_videos WHERE video_id = ? LIMIT 1',
+        [result.insertId]
+      );
+
+      if (videoRows?.[0]) insertedVideos.push(videoRows[0]);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Portfolio video uploaded successfully',
+      videos: insertedVideos,
+    });
+  } catch (error) {
+    console.error('uploadPortfolioVideo error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error during portfolio video upload',
+      error: error.message || String(error),
+    });
+  }
+};
+
+const getPortfolioVideos = async (req, res) => {
+  try {
+    const venueId = parsePositiveInt(req.params.venueId);
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Invalid venue ID' });
+    }
+
+    const [venueRows] = await query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const [rows] = await query(
+      `SELECT video_id, video_url AS url, title, description, display_order, createdAt
+       FROM tbl_venue_videos
+       WHERE venue_id = ?
+       ORDER BY display_order ASC, video_id ASC`,
+      [venueId]
+    );
+
+    return res.status(200).json({ success: true, videos: rows || [] });
+  } catch (error) {
+    console.error('getPortfolioVideos error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  }
+};
+
+const deletePortfolioVideo = async (req, res) => {
+  try {
+    const videoId = parsePositiveInt(req.params.videoId);
+    if (!videoId) {
+      return res.status(400).json({ success: false, message: 'Invalid video ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const [videoRows] = await query(
+      'SELECT video_id, venue_id, video_url, title, description, display_order, createdAt FROM tbl_venue_videos WHERE video_id = ? LIMIT 1',
+      [videoId]
+    );
+
+    if (!videoRows || videoRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Video not found' });
+    }
+
+    const video = videoRows[0];
+    if (venueId && Number(video.venue_id) !== Number(venueId)) {
+      return res.status(403).json({ success: false, message: 'You do not have access to delete this video' });
+    }
+
+    await query('DELETE FROM tbl_venue_videos WHERE video_id = ?', [videoId]);
+
+    return res.status(200).json({ success: true, message: 'Video deleted successfully', deletedVideo: video });
+  } catch (error) {
+    console.error('deletePortfolioVideo error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  }
+};
+
+const deleteVenueTransportation = async (req, res) => {
+  try {
+    const transportationId = parsePositiveInt(req.params.transportationId ?? req.params.id);
+    if (!transportationId) {
+      return res.status(400).json({ success: false, message: 'Invalid transportation ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId ?? req.body?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const [rows] = await query(
+      'SELECT id, venue_id, mode, name, distance, created_at, updated_at FROM table_venue_transportation WHERE id = ? LIMIT 1',
+      [transportationId]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Transportation not found' });
+    }
+
+    const record = rows[0];
+    if (venueId && Number(record.venue_id) !== Number(venueId)) {
+      return res.status(403).json({ success: false, message: 'You do not have access to delete this transportation' });
+    }
+
+    await query('DELETE FROM table_venue_transportation WHERE id = ?', [transportationId]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Transportation deleted successfully',
+      deletedTransportation: record,
+    });
+  } catch (error) {
+    console.error('deleteVenueTransportation error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  }
+};
+
+const upsertVenuePolicies = async (req, res) => {
+  let conn;
+  try {
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId =
+        parsePositiveInt(req.params?.venueId) ||
+        parsePositiveInt(req.body?.venueId ?? req.query?.venueId) ||
+        null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Venue ID is required' });
+    }
+
+    const body = req.body || {};
+    const policyColumns = [
+      { column: 'booking_policy', value: body.booking_policy ?? body.bookingPolicy },
+      { column: 'cancellation_policy', value: body.cancellation_policy ?? body.cancellationPolicy },
+      { column: 'refund_policy', value: body.refund_policy ?? body.refundPolicy },
+      { column: 'reschedule_policy', value: body.reschedule_policy ?? body.reschedulePolicy },
+      { column: 'outside_decorator_policy', value: body.outside_decorator_policy ?? body.outsideDecoratorPolicy },
+      { column: 'outside_photographer_policy', value: body.outside_photographer_policy ?? body.outsidePhotographerPolicy },
+      { column: 'terms_conditions', value: body.terms_conditions ?? body.termsConditions },
+      { column: 'disclaimer', value: body.disclaimer },
+    ];
+
+    const provided = policyColumns.filter((p) => p.value !== undefined);
+    if (provided.length === 0) {
+      return res.status(400).json({ success: false, message: 'No policy fields provided for update' });
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [venueRows] = await conn.query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const [existing] = await conn.query('SELECT id FROM tbl_venue_policies WHERE venue_id = ? LIMIT 1', [venueId]);
+
+    if (!existing || existing.length === 0) {
+      const columns = ['venue_id'];
+      const placeholders = ['?'];
+      const values = [venueId];
+
+      for (const p of provided) {
+        columns.push(p.column);
+        placeholders.push('?');
+        values.push(p.value);
+      }
+
+      await conn.query(
+        `INSERT INTO tbl_venue_policies (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`,
+        values
+      );
+    } else {
+      const sets = [];
+      const values = [];
+      for (const p of provided) {
+        sets.push(`${p.column} = ?`);
+        values.push(p.value);
+      }
+      sets.push('updatedAt = CURRENT_TIMESTAMP');
+      values.push(venueId);
+
+      await conn.query(`UPDATE tbl_venue_policies SET ${sets.join(', ')} WHERE venue_id = ?`, values);
+    }
+
+    const [rows] = await conn.query(
+      `SELECT booking_policy, cancellation_policy, refund_policy, reschedule_policy,
+              outside_decorator_policy, outside_photographer_policy, terms_conditions, disclaimer,
+              createdAt, updatedAt
+       FROM tbl_venue_policies WHERE venue_id = ? LIMIT 1`,
+      [venueId]
+    );
+
+    await conn.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Policies saved successfully',
+      venue_id: venueId,
+      policies: rows?.[0] || null,
+    });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('upsertVenuePolicies error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const deleteVenuePolicies = async (req, res) => {
+  let conn;
+  try {
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId =
+        parsePositiveInt(req.params?.venueId) ||
+        parsePositiveInt(req.query?.venueId ?? req.body?.venueId) ||
+        null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Venue ID is required' });
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query('SELECT id FROM tbl_venue_policies WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!rows || rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'Policies not found for this venue' });
+    }
+
+    await conn.query('DELETE FROM tbl_venue_policies WHERE venue_id = ?', [venueId]);
+    await conn.commit();
+
+    return res.status(200).json({ success: true, message: 'Policies deleted successfully', venue_id: venueId });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('deleteVenuePolicies error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const createVenueServicePackages = async (req, res) => {
+  let conn;
+  try {
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId =
+        parsePositiveInt(req.body?.venueId ?? req.query?.venueId ?? req.params?.venueId) ||
+        null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Venue ID is required' });
+    }
+
+    const body = req.body || {};
+    const packagesInput = body.packages ?? body.service_packages ?? body.servicePackages ?? body.package ?? body;
+    const packages = Array.isArray(packagesInput) ? packagesInput : [packagesInput];
+
+    const sanitized = packages
+      .filter((p) => p && typeof p === 'object')
+      .map((p) => ({
+        package_name: p.package_name ?? p.packageName,
+        description: p.description,
+        service_type: p.service_type ?? p.serviceType,
+        price: p.price,
+        offer_price: p.offer_price ?? p.offerPrice,
+      }));
+
+    if (sanitized.length === 0) {
+      return res.status(400).json({ success: false, message: 'No packages provided' });
+    }
+
+    for (const p of sanitized) {
+      const name = String(p.package_name ?? '').trim();
+      if (!name) {
+        return res.status(400).json({ success: false, message: 'package_name is required for each package' });
+      }
+      p.package_name = name;
+
+      if (p.description !== undefined && p.description !== null) p.description = String(p.description);
+      if (p.service_type !== undefined) p.service_type = normalizeCsvTextList(p.service_type);
+
+      if (p.price !== undefined) {
+        if (p.price === null || String(p.price).trim() === '') {
+          p.price = null;
+        } else {
+          const parsed = parseNonNegativeInt(p.price);
+          if (parsed === null) {
+            return res.status(400).json({ success: false, message: 'Invalid price for package' });
+          }
+          p.price = parsed;
+        }
+      } else {
+        p.price = null;
+      }
+
+      if (p.offer_price !== undefined) {
+        if (p.offer_price === null || String(p.offer_price).trim() === '') {
+          p.offer_price = null;
+        } else {
+          const parsed = parseNonNegativeInt(p.offer_price);
+          if (parsed === null) {
+            return res.status(400).json({ success: false, message: 'Invalid offer_price for package' });
+          }
+          p.offer_price = parsed;
+        }
+      } else {
+        p.offer_price = null;
+      }
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [venueRows] = await conn.query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    // Prevent duplicate package_name (case-insensitive) for same venue_id
+    const incomingNameKeys = sanitized.map((p) => p.package_name.toLowerCase());
+    const incomingSeen = new Set();
+    for (const key of incomingNameKeys) {
+      if (incomingSeen.has(key)) {
+        await conn.rollback();
+        return res.status(400).json({ success: false, message: 'Duplicate package_name in request is not allowed' });
+      }
+      incomingSeen.add(key);
+    }
+
+    const [existingNameRows] = await conn.query(
+      `SELECT id, package_name
+       FROM tbl_venue_service_packages
+       WHERE venue_id = ? AND LOWER(TRIM(package_name)) IN (${incomingNameKeys.map(() => '?').join(',')})
+       LIMIT 1`,
+      [venueId, ...incomingNameKeys]
+    );
+
+    if (existingNameRows && existingNameRows.length > 0) {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: 'package_name already exists for this venue' });
+    }
+
+    const insertedIds = [];
+    for (const p of sanitized) {
+      const [result] = await conn.query(
+        `INSERT INTO tbl_venue_service_packages (venue_id, package_name, description, service_type, price, offer_price)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [venueId, p.package_name, p.description ?? null, p.service_type ?? null, p.price, p.offer_price]
+      );
+      insertedIds.push(Number(result.insertId));
+    }
+
+    const [rows] = await conn.query(
+      `SELECT id, venue_id, package_name, description, service_type, price, offer_price, created_at, updated_at
+       FROM tbl_venue_service_packages
+       WHERE id IN (${insertedIds.map(() => '?').join(',')})
+       ORDER BY id ASC`,
+      insertedIds
+    );
+
+    await conn.commit();
+    return res.status(201).json({
+      success: true,
+      message: 'Service packages created successfully',
+      venue_id: venueId,
+      packages: rows || [],
+    });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('createVenueServicePackages error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const updateVenueServicePackage = async (req, res) => {
+  let conn;
+  try {
+    const packageId = parsePositiveInt(req.params.packageId ?? req.params.id);
+    if (!packageId) {
+      return res.status(400).json({ success: false, message: 'Invalid package ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId ?? req.body?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const body = req.body || {};
+    const update = {
+      package_name: body.package_name ?? body.packageName,
+      description: body.description,
+      service_type: body.service_type ?? body.serviceType,
+      price: body.price,
+      offer_price: body.offer_price ?? body.offerPrice,
+    };
+
+    const fields = [];
+    const values = [];
+
+    if (update.package_name !== undefined) {
+      const name = update.package_name === null ? '' : String(update.package_name).trim();
+      if (!name) {
+        return res.status(400).json({ success: false, message: 'package_name cannot be empty' });
+      }
+      fields.push('package_name = ?');
+      values.push(name);
+    }
+
+    if (update.description !== undefined) {
+      fields.push('description = ?');
+      values.push(update.description === null ? null : String(update.description));
+    }
+
+    if (update.service_type !== undefined) {
+      fields.push('service_type = ?');
+      values.push(update.service_type === null ? null : normalizeCsvTextList(update.service_type));
+    }
+
+    if (update.price !== undefined) {
+      if (update.price === null || String(update.price).trim() === '') {
+        fields.push('price = ?');
+        values.push(null);
+      } else {
+        const parsed = parseNonNegativeInt(update.price);
+        if (parsed === null) return res.status(400).json({ success: false, message: 'Invalid price' });
+        fields.push('price = ?');
+        values.push(parsed);
+      }
+    }
+
+    if (update.offer_price !== undefined) {
+      if (update.offer_price === null || String(update.offer_price).trim() === '') {
+        fields.push('offer_price = ?');
+        values.push(null);
+      } else {
+        const parsed = parseNonNegativeInt(update.offer_price);
+        if (parsed === null) return res.status(400).json({ success: false, message: 'Invalid offer_price' });
+        fields.push('offer_price = ?');
+        values.push(parsed);
+      }
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ success: false, message: 'No valid fields provided for update' });
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [existingRows] = await conn.query(
+      `SELECT id, venue_id, package_name, description, service_type, price, offer_price, created_at, updated_at
+       FROM tbl_venue_service_packages WHERE id = ? LIMIT 1`,
+      [packageId]
+    );
+
+    if (!existingRows || existingRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'Package not found' });
+    }
+
+    const existing = existingRows[0];
+    if (venueId && Number(existing.venue_id) !== Number(venueId)) {
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: 'You do not have access to update this package' });
+    }
+
+    // Prevent duplicate package_name (case-insensitive) for same venue_id
+    if (update.package_name !== undefined) {
+      const incomingNameKey = String(update.package_name ?? '').trim().toLowerCase();
+      const [dupRows] = await conn.query(
+        `SELECT id FROM tbl_venue_service_packages
+         WHERE venue_id = ? AND LOWER(TRIM(package_name)) = ? AND id <> ?
+         LIMIT 1`,
+        [existing.venue_id, incomingNameKey, packageId]
+      );
+      if (dupRows && dupRows.length > 0) {
+        await conn.rollback();
+        return res.status(400).json({ success: false, message: 'package_name already exists for this venue' });
+      }
+    }
+
+    fields.push('updated_at = CURRENT_TIMESTAMP');
+    values.push(packageId);
+
+    await conn.query(`UPDATE tbl_venue_service_packages SET ${fields.join(', ')} WHERE id = ?`, values);
+
+    const [updatedRows] = await conn.query(
+      `SELECT id, venue_id, package_name, description, service_type, price, offer_price, created_at, updated_at
+       FROM tbl_venue_service_packages WHERE id = ? LIMIT 1`,
+      [packageId]
+    );
+
+    await conn.commit();
+    return res.status(200).json({
+      success: true,
+      message: 'Service package updated successfully',
+      package: updatedRows?.[0] || null,
+    });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('updateVenueServicePackage error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const deleteVenueServicePackage = async (req, res) => {
+  let conn;
+  try {
+    const packageId = parsePositiveInt(req.params.packageId ?? req.params.id);
+    if (!packageId) {
+      return res.status(400).json({ success: false, message: 'Invalid package ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId ?? req.body?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      `SELECT id, venue_id, package_name, description, service_type, price, offer_price, created_at, updated_at
+       FROM tbl_venue_service_packages WHERE id = ? LIMIT 1`,
+      [packageId]
+    );
+
+    if (!rows || rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'Package not found' });
+    }
+
+    const record = rows[0];
+    if (venueId && Number(record.venue_id) !== Number(venueId)) {
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: 'You do not have access to delete this package' });
+    }
+
+    await conn.query('DELETE FROM tbl_venue_service_packages WHERE id = ?', [packageId]);
+    await conn.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Service package deleted successfully',
+      deletedPackage: record,
+    });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('deleteVenueServicePackage error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const createVenueFaqs = async (req, res) => {
+  let conn;
+  try {
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.body?.venueId ?? req.query?.venueId ?? req.params?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Venue ID is required' });
+    }
+
+    const body = req.body || {};
+    const faqsInput = body.faqs ?? body.venue_faqs ?? body.venueFaqs ?? body.faq ?? body;
+    const faqs = Array.isArray(faqsInput) ? faqsInput : [faqsInput];
+
+    const sanitized = faqs
+      .filter((f) => f && typeof f === 'object')
+      .map((f) => ({
+        question: f.question,
+        answer: f.answer,
+        status: f.status,
+      }));
+
+    if (sanitized.length === 0) {
+      return res.status(400).json({ success: false, message: 'No FAQs provided' });
+    }
+
+    for (const f of sanitized) {
+      const question = String(f.question ?? '').trim();
+      const answer = String(f.answer ?? '').trim();
+      if (!question) return res.status(400).json({ success: false, message: 'question is required for each FAQ' });
+      if (!answer) return res.status(400).json({ success: false, message: 'answer is required for each FAQ' });
+      f.question = question;
+      f.answer = answer;
+
+      const statusParsed = f.status === undefined ? 1 : toBoolInt(f.status);
+      if (statusParsed === null) {
+        return res.status(400).json({ success: false, message: 'Invalid status for FAQ' });
+      }
+      f.status = statusParsed;
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [venueRows] = await conn.query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const questionKeys = sanitized.map((f) => f.question.toLowerCase());
+    const seen = new Set();
+    for (const key of questionKeys) {
+      if (seen.has(key)) {
+        await conn.rollback();
+        return res.status(400).json({ success: false, message: 'Duplicate question in request is not allowed' });
+      }
+      seen.add(key);
+    }
+
+    const [existingRows] = await conn.query(
+      `SELECT id FROM tbl_venue_faqs
+       WHERE venue_id = ? AND LOWER(TRIM(question)) IN (${questionKeys.map(() => '?').join(',')})
+       LIMIT 1`,
+      [venueId, ...questionKeys]
+    );
+
+    if (existingRows && existingRows.length > 0) {
+      await conn.rollback();
+      return res.status(400).json({ success: false, message: 'Question already exists for this venue' });
+    }
+
+    const insertedIds = [];
+    for (const f of sanitized) {
+      const [result] = await conn.query(
+        `INSERT INTO tbl_venue_faqs (venue_id, question, answer, status)
+         VALUES (?, ?, ?, ?)`,
+        [venueId, f.question, f.answer, f.status]
+      );
+      insertedIds.push(Number(result.insertId));
+    }
+
+    const [rows] = await conn.query(
+      `SELECT id, venue_id, question, answer, status, created_at, updated_at
+       FROM tbl_venue_faqs
+       WHERE id IN (${insertedIds.map(() => '?').join(',')})
+       ORDER BY id ASC`,
+      insertedIds
+    );
+
+    await conn.commit();
+    return res.status(201).json({
+      success: true,
+      message: 'FAQs created successfully',
+      venue_id: venueId,
+      faqs: rows || [],
+    });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('createVenueFaqs error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const updateVenueFaq = async (req, res) => {
+  let conn;
+  try {
+    const faqId = parsePositiveInt(req.params.faqId ?? req.params.id);
+    if (!faqId) {
+      return res.status(400).json({ success: false, message: 'Invalid FAQ ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId ?? req.body?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    const body = req.body || {};
+    const questionRaw = body.question;
+    const answerRaw = body.answer;
+    const statusRaw = body.status;
+
+    const fields = [];
+    const values = [];
+
+    if (questionRaw !== undefined) {
+      const q = questionRaw === null ? '' : String(questionRaw).trim();
+      if (!q) return res.status(400).json({ success: false, message: 'question cannot be empty' });
+      fields.push('question = ?');
+      values.push(q);
+    }
+
+    if (answerRaw !== undefined) {
+      const a = answerRaw === null ? '' : String(answerRaw).trim();
+      if (!a) return res.status(400).json({ success: false, message: 'answer cannot be empty' });
+      fields.push('answer = ?');
+      values.push(a);
+    }
+
+    if (statusRaw !== undefined) {
+      const parsed = toBoolInt(statusRaw);
+      if (parsed === null) return res.status(400).json({ success: false, message: 'Invalid status' });
+      fields.push('status = ?');
+      values.push(parsed);
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ success: false, message: 'No valid fields provided for update' });
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [existingRows] = await conn.query(
+      `SELECT id, venue_id, question, answer, status, created_at, updated_at
+       FROM tbl_venue_faqs WHERE id = ? LIMIT 1`,
+      [faqId]
+    );
+
+    if (!existingRows || existingRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'FAQ not found' });
+    }
+
+    const existing = existingRows[0];
+    if (venueId && Number(existing.venue_id) !== Number(venueId)) {
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: 'You do not have access to update this FAQ' });
+    }
+
+    if (questionRaw !== undefined) {
+      const questionKey = String(questionRaw ?? '').trim().toLowerCase();
+      const [dupRows] = await conn.query(
+        `SELECT id FROM tbl_venue_faqs
+         WHERE venue_id = ? AND LOWER(TRIM(question)) = ? AND id <> ?
+         LIMIT 1`,
+        [existing.venue_id, questionKey, faqId]
+      );
+      if (dupRows && dupRows.length > 0) {
+        await conn.rollback();
+        return res.status(400).json({ success: false, message: 'Question already exists for this venue' });
+      }
+    }
+
+    fields.push('updated_at = CURRENT_TIMESTAMP');
+    values.push(faqId);
+    await conn.query(`UPDATE tbl_venue_faqs SET ${fields.join(', ')} WHERE id = ?`, values);
+
+    const [updatedRows] = await conn.query(
+      `SELECT id, venue_id, question, answer, status, created_at, updated_at
+       FROM tbl_venue_faqs WHERE id = ? LIMIT 1`,
+      [faqId]
+    );
+
+    await conn.commit();
+    return res.status(200).json({ success: true, message: 'FAQ updated successfully', faq: updatedRows?.[0] || null });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('updateVenueFaq error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const deleteVenueFaq = async (req, res) => {
+  let conn;
+  try {
+    const faqId = parsePositiveInt(req.params.faqId ?? req.params.id);
+    if (!faqId) {
+      return res.status(400).json({ success: false, message: 'Invalid FAQ ID' });
+    }
+
+    const auth = req.user || req.auth || {};
+    const role = String(auth.role || '').toLowerCase();
+
+    let venueId;
+    if (role === 'admin' || role === 'salesteam') {
+      venueId = parsePositiveInt(req.query?.venueId ?? req.body?.venueId) || null;
+    } else {
+      venueId = parsePositiveInt(auth.id) || null;
+    }
+
+    conn = await getConnection();
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      `SELECT id, venue_id, question, answer, status, created_at, updated_at
+       FROM tbl_venue_faqs WHERE id = ? LIMIT 1`,
+      [faqId]
+    );
+
+    if (!rows || rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: 'FAQ not found' });
+    }
+
+    const record = rows[0];
+    if (venueId && Number(record.venue_id) !== Number(venueId)) {
+      await conn.rollback();
+      return res.status(403).json({ success: false, message: 'You do not have access to delete this FAQ' });
+    }
+
+    await conn.query('DELETE FROM tbl_venue_faqs WHERE id = ?', [faqId]);
+    await conn.commit();
+
+    return res.status(200).json({ success: true, message: 'FAQ deleted successfully', deletedFaq: record });
+  } catch (error) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // no-op
+      }
+    }
+    console.error('deleteVenueFaq error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  } finally {
+    if (conn) conn.release();
+  }
+};
+
+const getVenueFaqs = async (req, res) => {
+  try {
+    const venueId = parsePositiveInt(req.params.venueId ?? req.params.id ?? req.query?.venueId);
+    if (!venueId) {
+      return res.status(400).json({ success: false, message: 'Invalid venue ID' });
+    }
+
+    const [venueRows] = await query('SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1', [venueId]);
+    if (!venueRows || venueRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Venue not found' });
+    }
+
+    const [rows] = await query(
+      `SELECT id, venue_id, question, answer, status, created_at, updated_at
+       FROM tbl_venue_faqs
+       WHERE venue_id = ?
+       ORDER BY id ASC`,
+      [venueId]
+    );
+
+    return res.status(200).json({ success: true, venue_id: venueId, faqs: rows || [] });
+  } catch (error) {
+    console.error('getVenueFaqs error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message || String(error) });
+  }
+};
+
 // Update Venue profile 
 const updateVenueProfile = async (req, res) => {
   let conn;
@@ -508,8 +1934,40 @@ const updateVenueProfile = async (req, res) => {
     const body = req.body || {};
     const hasAmenityUpdate = body.amenity_ids !== undefined || body.amenityIds !== undefined;
     const hasOccasionUpdate = body.occasion_ids !== undefined || body.occasionIds !== undefined;
+    const hasServiceUpdate =
+      body.service_ids !== undefined || body.serviceIds !== undefined || body.services !== undefined;
+    const hasServiceAreaUpdate =
+      body.service_area_city_ids !== undefined ||
+      body.serviceAreaCityIds !== undefined ||
+      body.service_areas !== undefined ||
+      body.serviceAreas !== undefined;
+    const hasTransportationUpdate =
+      body.transportation !== undefined || body.transportations !== undefined || body.venue_transportation !== undefined;
+
     const amenityIds = parseIdList(body.amenity_ids ?? body.amenityIds);
     const occasionIds = parseIdList(body.occasion_ids ?? body.occasionIds);
+    const serviceIds = parseFlexibleIdList(body.service_ids ?? body.serviceIds ?? body.services);
+    const serviceAreaCityIds = parseFlexibleIdList(
+      body.service_area_city_ids ?? body.serviceAreaCityIds ?? body.service_areas ?? body.serviceAreas
+    );
+
+    const explicitFoodPricingInput =
+      body.food_pricing ?? body.foodPricing ?? body.cuisinePricing ?? body.cuisinesPricing ?? body.cuisine_pricing;
+
+    let hasFoodPricingUpdate = explicitFoodPricingInput !== undefined;
+    let foodPricingParsed = parseFoodPricingInput(explicitFoodPricingInput);
+
+    if (!hasFoodPricingUpdate && body.cuisines !== undefined) {
+      const trial = parseFoodPricingInput(body.cuisines);
+      if (trial?.ok === true) {
+        hasFoodPricingUpdate = true;
+        foodPricingParsed = trial;
+      }
+    }
+
+    const transportationParsed = parseTransportationInput(
+      body.transportation ?? body.transportations ?? body.venue_transportation
+    );
 
     const fields = [];
     const values = [];
@@ -581,7 +2039,14 @@ const updateVenueProfile = async (req, res) => {
     }
 
     if (fields.length === 0) {
-      if (!hasAmenityUpdate && !hasOccasionUpdate) {
+      if (
+        !hasAmenityUpdate &&
+        !hasOccasionUpdate &&
+        !hasServiceUpdate &&
+        !hasServiceAreaUpdate &&
+        !hasFoodPricingUpdate &&
+        !hasTransportationUpdate
+      ) {
         return res.status(400).json({ message: 'No valid fields provided for update' });
       }
     }
@@ -650,6 +2115,144 @@ const updateVenueProfile = async (req, res) => {
       }
     }
 
+    if (hasServiceUpdate) {
+      if (serviceIds === null) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Invalid service IDs format' });
+      }
+
+      if (serviceIds.length > 0) {
+        const [validServices] = await conn.query(
+          `SELECT service_id FROM tbl_services WHERE service_id IN (${serviceIds.map(() => '?').join(',')})`,
+          serviceIds
+        );
+        if (validServices.length !== serviceIds.length) {
+          await conn.rollback();
+          return res.status(400).json({ message: 'One or more service IDs are invalid' });
+        }
+      }
+
+      await conn.query('DELETE FROM tbl_venue_service_map WHERE venue_id = ?', [vendorId]);
+      if (serviceIds.length > 0) {
+        const serviceValues = serviceIds.map((id) => [Number(vendorId), id]);
+        await conn.query('INSERT INTO tbl_venue_service_map (venue_id, service_id) VALUES ?', [serviceValues]);
+      }
+    }
+
+    if (hasServiceAreaUpdate) {
+      if (serviceAreaCityIds === null) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Invalid service area city IDs format' });
+      }
+
+      if (serviceAreaCityIds.length > 0) {
+        const [validCities] = await conn.query(
+          `SELECT city_id, city_name FROM tbl_city WHERE city_id IN (${serviceAreaCityIds.map(() => '?').join(',')})`,
+          serviceAreaCityIds
+        );
+
+        if (validCities.length !== serviceAreaCityIds.length) {
+          await conn.rollback();
+          return res.status(400).json({ message: 'One or more city IDs are invalid for service areas' });
+        }
+
+        const cityNameById = new Map(validCities.map((row) => [Number(row.city_id), row.city_name]));
+
+        await conn.query('DELETE FROM tbl_venue_service_areas_cities WHERE venue_id = ?', [vendorId]);
+        const areaValues = serviceAreaCityIds.map((cityId) => [
+          Number(vendorId),
+          cityId,
+          cityNameById.get(Number(cityId)) || '',
+        ]);
+        await conn.query(
+          'INSERT INTO tbl_venue_service_areas_cities (venue_id, city_id, city_name) VALUES ?',
+          [areaValues]
+        );
+      } else {
+        await conn.query('DELETE FROM tbl_venue_service_areas_cities WHERE venue_id = ?', [vendorId]);
+      }
+    }
+
+    if (hasFoodPricingUpdate) {
+      if (!foodPricingParsed || foodPricingParsed.ok !== true) {
+        await conn.rollback();
+        return res.status(400).json({ message: foodPricingParsed?.message || 'Invalid food pricing format' });
+      }
+
+      const items = foodPricingParsed.items;
+      const cuisineIdsFromBody = items
+        .map((it) => it.cuisine_id)
+        .filter((id) => Number.isInteger(id) && id > 0);
+
+      const cuisineNames = items
+        .map((it) => it.cuisine_name)
+        .filter((name) => typeof name === 'string' && name.trim().length > 0)
+        .map((name) => name.trim());
+
+      const cuisineIdByLowerName = new Map();
+      if (cuisineNames.length > 0) {
+        const uniqueLowerNames = [...new Set(cuisineNames.map((n) => n.toLowerCase()))];
+        const [rows] = await conn.query(
+          `SELECT id, name FROM tbl_cuisines WHERE LOWER(name) IN (${uniqueLowerNames.map(() => '?').join(',')})`,
+          uniqueLowerNames
+        );
+        for (const row of rows) {
+          cuisineIdByLowerName.set(String(row.name).toLowerCase(), Number(row.id));
+        }
+        if (rows.length !== uniqueLowerNames.length) {
+          await conn.rollback();
+          return res.status(400).json({ message: 'One or more cuisines are invalid' });
+        }
+      }
+
+      const resolved = items.map((it) => {
+        if (it.cuisine_id) return { cuisine_id: it.cuisine_id, price: it.price };
+        const resolvedId = cuisineIdByLowerName.get(String(it.cuisine_name).toLowerCase());
+        return { cuisine_id: resolvedId, price: it.price };
+      });
+
+      const dedupedByCuisine = new Map();
+      for (const row of resolved) {
+        if (!row.cuisine_id) {
+          await conn.rollback();
+          return res.status(400).json({ message: 'One or more cuisines are invalid' });
+        }
+        dedupedByCuisine.set(Number(row.cuisine_id), Number(row.price));
+      }
+      const finalRows = [...dedupedByCuisine.entries()].map(([cuisine_id, price]) => ({ cuisine_id, price }));
+
+      const uniqueCuisineIds = [...new Set([...cuisineIdsFromBody, ...finalRows.map((r) => r.cuisine_id)].filter(Boolean))];
+      if (uniqueCuisineIds.length > 0) {
+        const [validCuisineRows] = await conn.query(
+          `SELECT id FROM tbl_cuisines WHERE id IN (${uniqueCuisineIds.map(() => '?').join(',')})`,
+          uniqueCuisineIds
+        );
+        if (validCuisineRows.length !== uniqueCuisineIds.length) {
+          await conn.rollback();
+          return res.status(400).json({ message: 'One or more cuisine IDs are invalid' });
+        }
+      }
+
+      await conn.query('DELETE FROM tbl_venue_foodpricing WHERE venue_id = ?', [vendorId]);
+      if (finalRows.length > 0) {
+        const foodValues = finalRows.map((row) => [Number(vendorId), Number(row.cuisine_id), Number(row.price)]);
+        await conn.query('INSERT INTO tbl_venue_foodpricing (venue_id, cuisine_id, price) VALUES ?', [foodValues]);
+      }
+    }
+
+    if (hasTransportationUpdate) {
+      if (!transportationParsed || transportationParsed.ok !== true) {
+        await conn.rollback();
+        return res.status(400).json({ message: transportationParsed?.message || 'Invalid transportation format' });
+      }
+
+      await conn.query('DELETE FROM table_venue_transportation WHERE venue_id = ?', [vendorId]);
+      if (transportationParsed.items.length > 0) {
+        const rows = transportationParsed.items.map((t) => [Number(vendorId), t.mode, t.name, t.distance]);
+        await conn.query('INSERT INTO table_venue_transportation (venue_id, mode, name, distance) VALUES ?', [rows]);
+      }
+    }
+
     const [updatedRows] = await conn.query(
       'SELECT venue_id AS id, businessName, businessType, contactName, email, phone, businessExperience, isPremium, profilePicture, address, city_id AS city, state_id AS state, country_id AS country, pinCode, nearLocation, status, updatedAt FROM tbl_venue WHERE venue_id = ? LIMIT 1',
       [vendorId]
@@ -673,6 +2276,40 @@ const updateVenueProfile = async (req, res) => {
       [vendorId]
     );
 
+    const [serviceRows] = await conn.query(
+      `SELECT s.service_id, s.service_name
+       FROM tbl_venue_service_map vsm
+       INNER JOIN tbl_services s ON s.service_id = vsm.service_id
+       WHERE vsm.venue_id = ?
+       ORDER BY s.service_name ASC`,
+      [vendorId]
+    );
+
+    const [serviceAreaRows] = await conn.query(
+      `SELECT city_id, city_name
+       FROM tbl_venue_service_areas_cities
+       WHERE venue_id = ?
+       ORDER BY city_name ASC`,
+      [vendorId]
+    );
+
+    const [foodPricingRows] = await conn.query(
+      `SELECT c.id AS cuisine_id, c.name AS cuisine, vf.price
+       FROM tbl_venue_foodpricing vf
+       INNER JOIN tbl_cuisines c ON c.id = vf.cuisine_id
+       WHERE vf.venue_id = ?
+       ORDER BY c.name ASC`,
+      [vendorId]
+    );
+
+    const [transportationRows] = await conn.query(
+      `SELECT id, mode, name, distance
+       FROM table_venue_transportation
+       WHERE venue_id = ?
+       ORDER BY id ASC`,
+      [vendorId]
+    );
+
     await conn.commit();
 
     return res.status(200).json({
@@ -681,6 +2318,10 @@ const updateVenueProfile = async (req, res) => {
       vendor: updatedRows[0],
       amenities: amenityRows,
       occasions: occasionRows,
+      services: serviceRows,
+      service_areas: serviceAreaRows,
+      food_pricing: foodPricingRows,
+      transportation: transportationRows,
     });
   } catch (error) {
     if (conn) {
@@ -2080,16 +3721,44 @@ const updateVenueSpace = async (req, res) => {
 // Delete Venue Spaces of Particular Venue
 const deleteVenueSpace = async (req, res) => {
   const spaceId = req.params.spaceId;
-  try {
-    if (!spaceId) return res.status(400).json({ message: 'Space ID is required' });
 
-    await query('DELETE FROM tbl_venue_spaces WHERE space_id = ?', [spaceId]);
-    return res.status(200).json({ message: 'Venue space deleted successfully' });
+  try {
+    if (!spaceId) {
+      return res.status(400).json({ message: 'Space ID is required' });
+    }
+
+    // 1. Get the record before deleting
+    const [space] = await query(
+      'SELECT * FROM tbl_venue_spaces WHERE space_id = ?',
+      [spaceId]
+    );
+
+    if (!space) {
+      return res.status(404).json({ message: 'Venue space not found' });
+    }
+
+    // 2. Delete the record
+    await query(
+      'DELETE FROM tbl_venue_spaces WHERE space_id = ?',
+      [spaceId]
+    );
+
+    // 3. Send deleted data in response
+    return res.status(200).json({
+      message: 'Venue space deleted successfully',
+      deletedData: space
+    });
+
   } catch (error) {
     console.error('deleteVenueSpace error:', error);
-    return res.status(500).json({ message: 'Error deleting venue space', error: error.message || String(error) });
+    return res.status(500).json({
+      message: 'Error deleting venue space',
+      error: error.message || String(error)
+    });
   }
 };
+
+
 
 module.exports = {
   registerVenue,
@@ -2099,6 +3768,22 @@ module.exports = {
   forgotPassword,
   resetPassword,
   loginVenue,
+  uploadPortfolioImage,
+  getPortfolioImages,
+  deletePortfolioImage,
+  uploadPortfolioVideo,
+  getPortfolioVideos,
+  deletePortfolioVideo,
+  deleteVenueTransportation,
+  upsertVenuePolicies,
+  deleteVenuePolicies,
+  createVenueServicePackages,
+  updateVenueServicePackage,
+  deleteVenueServicePackage,
+  createVenueFaqs,
+  updateVenueFaq,
+  deleteVenueFaq,
+  getVenueFaqs,
   getVenueById,
   updateVenueProfile,
   deleteVenue,
